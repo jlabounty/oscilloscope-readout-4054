@@ -94,9 +94,19 @@ def get_preamble(scope: pyvisa.Resource) -> dict:
     return preamble
 
 
-def fetch_channel(scope: pyvisa.Resource, channel: str) -> tuple[np.ndarray, np.ndarray, dict]:
+def fetch_channel(
+    scope: pyvisa.Resource,
+    channel: str,
+    pre_samples: int | None = 1000,
+    post_samples: int | None = 1000,
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Capture a single channel waveform.
+
+    Parameters
+    ----------
+    pre_samples  : samples to keep before the trigger (None = full record)
+    post_samples : samples to keep after the trigger  (None = full record)
 
     Returns
     -------
@@ -107,10 +117,29 @@ def fetch_channel(scope: pyvisa.Resource, channel: str) -> tuple[np.ndarray, np.
     scope.write(f"DATA:SOURCE {channel}")
     scope.write("DATA:ENCDG RIBINARY")   # signed binary — faster than ASCII
     scope.write("DATA:WIDTH 2")          # 2 bytes per sample → full 16-bit res
-    scope.write("DATA:START 1")
-    scope.write("DATA:STOP 1E10")        # capture entire record
 
+    # Fetch preamble first so we know the trigger position (PT_OFF) and
+    # record length (NR_PT) before setting the transfer window.
     meta = get_preamble(scope)
+
+    pt_off = int(float(meta.get("PT_OFF", 0)))
+    nr_pt  = int(meta.get("NR_PT", 0)) or None   # 0 → unknown
+
+    if pre_samples is None and post_samples is None:
+        # Full record
+        scope.write("DATA:START 1")
+        scope.write("DATA:STOP 1E10")
+        start_0idx = 0
+    else:
+        pre  = pre_samples  if pre_samples  is not None else pt_off
+        post = post_samples if post_samples is not None else (nr_pt - pt_off if nr_pt else int(1e10))
+        start_1idx = max(1, pt_off - pre + 1)
+        stop_1idx  = pt_off + post
+        if nr_pt:
+            stop_1idx = min(nr_pt, stop_1idx)
+        scope.write(f"DATA:START {start_1idx}")
+        scope.write(f"DATA:STOP {stop_1idx}")
+        start_0idx = start_1idx - 1   # convert to 0-based full-record index
 
     # Read raw binary curve
     raw_bytes = scope.query_binary_values(
@@ -118,16 +147,16 @@ def fetch_channel(scope: pyvisa.Resource, channel: str) -> tuple[np.ndarray, np.
     )
 
     # Scale to physical units
-    ymult  = float(meta.get("YMULT",  1.0))
-    yoff   = float(meta.get("YOFF",   0.0))
-    yzero  = float(meta.get("YZERO",  0.0))
-    xincr  = float(meta.get("XINCR",  1e-9))
-    xzero  = float(meta.get("XZERO",  0.0))
-    pt_off = float(meta.get("PT_OFF", 0.0))
-    n_pts  = len(raw_bytes)
+    ymult = float(meta.get("YMULT",  1.0))
+    yoff  = float(meta.get("YOFF",   0.0))
+    yzero = float(meta.get("YZERO",  0.0))
+    xincr = float(meta.get("XINCR",  1e-9))
+    xzero = float(meta.get("XZERO",  0.0))
+    n_pts = len(raw_bytes)
 
     volts  = (raw_bytes.astype(float) - yoff) * ymult + yzero
-    time_s = xzero + (np.arange(n_pts) - pt_off) * xincr
+    # Offset np.arange by start_0idx so times are correct for windowed captures
+    time_s = xzero + (start_0idx + np.arange(n_pts) - pt_off) * xincr
 
     return time_s, volts, meta
 
@@ -223,12 +252,62 @@ def prompt_notes() -> str:
     return input("Notes (optional): ").strip()
 
 
+def prompt_n_captures() -> int:
+    """Ask how many triggered captures to take (default 1)."""
+    while True:
+        raw = input("Number of captures [1]: ").strip()
+        if not raw:
+            return 1
+        try:
+            n = int(raw)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+        print("  Please enter a positive integer.")
+
+
 def prompt_yes_no(question: str, default: bool = True) -> bool:
     suffix = " [Y/n]: " if default else " [y/N]: "
     raw = input(question + suffix).strip().lower()
     if not raw:
         return default
     return raw.startswith("y")
+
+
+def prompt_window(
+    default_pre: int = 1000,
+    default_post: int = 1000,
+) -> tuple[int | None, int | None]:
+    """
+    Ask how many samples before/after the trigger to capture.
+
+    Enter two integers (pre post), or press Enter to keep the defaults.
+    Enter 0 0 (or 'all') to capture the full record.
+
+    Returns (pre_samples, post_samples); both None means full record.
+    """
+    while True:
+        prompt = (
+            f"Trigger window — pre post samples "
+            f"[{default_pre} {default_post}] (0 0 = full record): "
+        )
+        raw = input(prompt).strip()
+        if not raw:
+            return default_pre, default_post
+        if raw.lower() in {"all", "full"}:
+            return None, None
+        parts = raw.split()
+        if len(parts) == 2:
+            try:
+                pre, post = int(parts[0]), int(parts[1])
+                if pre == 0 and post == 0:
+                    return None, None
+                if pre >= 0 and post >= 0:
+                    return pre, post
+            except ValueError:
+                pass
+        print("  Enter two non-negative integers (e.g. '500 2000'), or press Enter for defaults.")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -255,27 +334,36 @@ def main():
             if session_file is None or prompt_yes_no("Change output file?", default=False):
                 session_file = prompt_filepath()
 
-            channels  = prompt_channels()
-            label     = prompt_label()
-            notes     = prompt_notes()
+            channels   = prompt_channels()
+            pre, post  = prompt_window()
+            n_captures = prompt_n_captures()
+            label      = prompt_label()
+            notes      = prompt_notes()
 
-            print(f"\nCapturing {', '.join(channels)} …")
-            captured = {}
-            for ch in channels:
-                print(f"  {ch} … ", end="", flush=True)
-                try:
-                    time_s, volts, meta = fetch_channel(scope, ch)
-                    captured[ch] = (time_s, volts, meta)
-                    n_pts = len(volts)
-                    duration_us = (time_s[-1] - time_s[0]) * 1e6
-                    print(f"{n_pts:,} pts  |  {duration_us:.1f} µs window")
-                except Exception as e:
-                    print(f"FAILED ({e})")
+            for i in range(1, n_captures + 1):
+                if n_captures > 1:
+                    capture_label = f"{label}_{i:03d}"
+                    print(f"\nCapture {i}/{n_captures}  ({', '.join(channels)}) …")
+                else:
+                    capture_label = label
+                    print(f"\nCapturing {', '.join(channels)} …")
 
-            if captured:
-                save_hdf5(session_file, captured, label=label, notes=notes)
-            else:
-                print("  No data captured — nothing saved.")
+                captured = {}
+                for ch in channels:
+                    print(f"  {ch} … ", end="", flush=True)
+                    try:
+                        time_s, volts, meta = fetch_channel(scope, ch, pre, post)
+                        captured[ch] = (time_s, volts, meta)
+                        n_pts = len(volts)
+                        duration_us = (time_s[-1] - time_s[0]) * 1e6
+                        print(f"{n_pts:,} pts  |  {duration_us:.1f} µs window")
+                    except Exception as e:
+                        print(f"FAILED ({e})")
+
+                if captured:
+                    save_hdf5(session_file, captured, label=capture_label, notes=notes)
+                else:
+                    print("  No data captured — nothing saved.")
 
             if not prompt_yes_no("\nCapture again?", default=True):
                 break
