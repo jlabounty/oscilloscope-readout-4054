@@ -38,7 +38,8 @@ Opens an interactive window with:
 - **Channels** — checkboxes for CH1–CH4
 - **Trigger Window** — pre/post-trigger sample counts (`0 0` = full record)
 - **Capture Options** — number of captures, wait time between captures (seconds, default 0), capture label, notes
-- **Capture** — starts acquisition; waveforms are plotted live as each channel is digitized; a red dashed trigger line is overlaid at t = 0 (XZERO); multiple captures are overlaid using the viridis colormap
+- **Capture** — starts acquisition; waveforms are plotted live as each channel is digitized; a red dashed trigger line is overlaid at t = 0 (XZERO); multiple captures are overlaid using the viridis colormap; a minimum of 0.1 s is enforced between successive captures regardless of the wait setting
+- **Histograms** — displayed alongside the waveforms; per-channel histograms of the baseline-subtracted pulse integral (V·s) and peak amplitude (V) accumulate across captures within a session; baseline is estimated from pre-trigger samples; a **Clear Histograms** button resets without interrupting capture
 
 ### CLI
 
@@ -105,6 +106,6 @@ Columns:
 
 - Transfer uses signed 16-bit binary encoding (`RIBINARY`) for speed — much faster than ASCII at long record lengths
 - All HDF5 datasets are gzip-compressed
-- Physical-unit scaling is applied from the WFMPRE preamble: `volts = (raw - YOFF) * YMULT + YZERO`
+- Physical-unit scaling is applied from the WFMPRE preamble: `volts = (raw - YOFF) * YMULT + YZERO`; preamble fields are queried individually (`WFMPRE:YMULT?`, `WFMPRE:YOFF?`, …) because the DPO4054 returns only the WFID string for the bulk `WFMPRE?` query
 - Memory is frozen with `ACQUIRE:STATE STOP` before reading all channels, ensuring every channel comes from the same trigger event; acquisition is re-armed with `ACQUIRE:STATE RUN` afterwards
 - Programmer reference: Tektronix MSO4000/DPO4000 Series Programmer Manual (077-0248-01)
