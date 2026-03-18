@@ -208,3 +208,5 @@ __marimo__/
 .claude
 data/
 **.h5
+**.tsv
+.vscode

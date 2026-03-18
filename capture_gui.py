@@ -29,7 +29,7 @@ except ImportError:
     import sys; sys.exit("Missing dependency: pip install pyvisa pyvisa-py")
 
 # Import core functions from the existing capture script
-from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5, log_capture_tsv
+from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5, log_capture_tsv, get_scope_state
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -416,6 +416,7 @@ class WaveformApp:
                         break
                 capture_label = f"{label}_{i+1:03d}" if n > 1 else label
                 scope.write("ACQUIRE:STATE STOP")   # freeze memory — all channels from same trigger
+                scope_state = get_scope_state(scope, channels)
                 captured = {}
                 for ch in channels:
                     if self._stop_event.is_set():
@@ -428,8 +429,8 @@ class WaveformApp:
                     self.result_queue.put(("channel_done", i, ch, time_s, volts, meta))
 
                 if captured:
-                    save_hdf5(filepath, captured, label=capture_label, notes=notes)
-                    log_capture_tsv(filepath, capture_label, channels, pre, post, notes)
+                    save_hdf5(filepath, captured, label=capture_label, notes=notes, scope_state=scope_state)
+                    log_capture_tsv(filepath, capture_label, channels, pre, post, notes, scope_state=scope_state)
                     self.result_queue.put(("capture_done", i + 1, n, str(filepath)))
                 scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
 

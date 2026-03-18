@@ -116,7 +116,7 @@ def fetch_channel(
     -------
     time_s   : 1-D array of time values in seconds
     volts    : 1-D array of voltage values in volts
-    meta     : dict of preamble metadata
+    meta     : dict of preamble + per-channel display settings
     """
     scope.write(f"DATA:SOURCE {channel}")
     scope.write("DATA:ENCDG RIBINARY")   # signed binary — faster than ASCII
@@ -125,6 +125,18 @@ def fetch_channel(
     # Fetch preamble first so we know the trigger position (PT_OFF) and
     # record length (NR_PT) before setting the transfer window.
     meta = get_preamble(scope)
+
+    # Per-channel display settings (not in WFMPRE)
+    for key, cmd in [
+        ("CH_COUPLING",  f"{channel}:COUPling?"),
+        ("CH_SCALE",     f"{channel}:SCAle?"),
+        ("CH_BANDWIDTH", f"{channel}:BANdwidth?"),
+        ("CH_PROBE",     f"{channel}:PRObe?"),
+    ]:
+        try:
+            meta[key] = scope.query(cmd).strip()
+        except Exception:
+            pass
 
     pt_off = int(float(meta.get("PT_OFF", 0)))
     nr_pt  = int(meta.get("NR_PT", 0)) or None   # 0 → unknown
@@ -165,6 +177,41 @@ def fetch_channel(
     return time_s, volts, meta
 
 
+# ── Capture-level scope state ──────────────────────────────────────────────────
+
+# SCPI queries for settings not present in WFMPRE, keyed by the TSV/HDF5 field name
+SCOPE_STATE_QUERIES: dict[str, str] = {
+    "sample_rate_hz": "HORizontal:SAMPLERate?",
+    "h_scale_s_div":  "HORizontal:SCAle?",
+    "trig_type":      "TRIGger:MAIn:TYPE?",
+    "trig_level_v":   "TRIGger:MAIn:LEVEL?",
+    "trig_source":    "TRIGger:MAIn:EDGE:SOUrce?",
+    "trig_slope":     "TRIGger:MAIn:EDGE:SLOpe?",
+    "trig_freq_hz":   "TRIGger:FREQuency?",
+    "acq_mode":       "ACQuire:MODe?",
+    "acq_numavg":     "ACQuire:NUMAVg?",
+}
+
+
+def get_scope_state(scope: pyvisa.Resource, channels: list[str]) -> dict:
+    """Query capture-level scope settings not present in WFMPRE.
+
+    Queries horizontal settings (sample rate, scale), trigger configuration
+    (type, source, level, slope, frequency/rate), and acquire mode.
+    Unsupported queries are silently omitted so the function is safe to call
+    on any firmware version.
+
+    Returns a flat dict of str → str.
+    """
+    state: dict[str, str] = {}
+    for key, cmd in SCOPE_STATE_QUERIES.items():
+        try:
+            state[key] = scope.query(cmd).strip()
+        except Exception:
+            pass
+    return state
+
+
 # ── HDF5 saving ───────────────────────────────────────────────────────────────
 
 def save_hdf5(
@@ -172,6 +219,7 @@ def save_hdf5(
     channels: dict[str, tuple[np.ndarray, np.ndarray, dict]],
     label: str,
     notes: str = "",
+    scope_state: dict | None = None,
 ) -> None:
     """
     Save one or more channel captures to an HDF5 file.
@@ -179,11 +227,12 @@ def save_hdf5(
     File layout
     -----------
     /  (root attrs)  label, timestamp, notes
-    /CH1/
-         time_s      dataset
-         volts       dataset
-         attrs       all WFMPRE preamble fields
-    /CH2/ ...
+    /<capture_label>/  (attrs: timestamp, notes, + all scope_state fields)
+        /CH1/
+             time_s      dataset
+             volts       dataset
+             attrs       all WFMPRE preamble fields + CH_* display settings
+        /CH2/ ...
     """
     mode = "a" if filepath.exists() else "w"
     with h5py.File(filepath, mode) as f:
@@ -200,13 +249,21 @@ def save_hdf5(
         cap_grp.attrs["timestamp"] = datetime.now().isoformat()
         cap_grp.attrs["notes"] = notes
 
+        # Capture-level scope state (horizontal, trigger, acquire settings)
+        if scope_state:
+            for k, v in scope_state.items():
+                try:
+                    cap_grp.attrs[k] = v
+                except Exception:
+                    pass
+
         for ch_name, (time_s, volts, meta) in channels.items():
             ch_grp = cap_grp.create_group(ch_name)
             ds_t = ch_grp.create_dataset("time_s", data=time_s, compression="gzip")
             ds_v = ch_grp.create_dataset("volts",  data=volts,  compression="gzip")
             ds_t.attrs["units"] = "s"
             ds_v.attrs["units"] = meta.get("YUNIT", "V")
-            # Store full preamble
+            # Store WFMPRE preamble + per-channel display settings (CH_* keys)
             for k, v in meta.items():
                 try:
                     ch_grp.attrs[k] = v
@@ -221,6 +278,10 @@ def save_hdf5(
 TSV_COLUMNS = [
     "timestamp", "capture_label", "hdf5_file",
     "channels", "pre_samples", "post_samples", "notes",
+    # Scope state — filled when a live scope connection is available
+    "sample_rate_hz", "h_scale_s_div",
+    "trig_type", "trig_source", "trig_level_v", "trig_slope", "trig_freq_hz",
+    "acq_mode", "acq_numavg",
 ]
 
 def log_capture_tsv(
@@ -230,19 +291,28 @@ def log_capture_tsv(
     pre_samples: int | None,
     post_samples: int | None,
     notes: str = "",
+    scope_state: dict | None = None,
 ) -> None:
     """Append one row to a TSV log file co-located with the HDF5 output.
 
     The TSV file has the same path as *filepath* but with a .tsv extension.
     A header row is written automatically the first time the file is created.
-    Tab and newline characters in *notes* are collapsed to spaces so the row
-    stays on a single line.
+    Tab and newline characters in free-text fields are collapsed to spaces so
+    each capture occupies exactly one line.
+
+    scope_state keys used (all optional, written as empty string if absent):
+        sample_rate_hz, h_scale_s_div, trig_type, trig_source, trig_level_v,
+        trig_slope, trig_freq_hz, acq_mode, acq_numavg
     """
     tsv_path = filepath.with_suffix(".tsv")
     write_header = not tsv_path.exists()
     pre_str  = str(pre_samples)  if pre_samples  is not None else "full"
     post_str = str(post_samples) if post_samples is not None else "full"
-    clean_notes = notes.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+    def _clean(s: str) -> str:
+        return s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+    s = scope_state or {}
     row = "\t".join([
         datetime.now().isoformat(),
         label,
@@ -250,7 +320,16 @@ def log_capture_tsv(
         ",".join(channels),
         pre_str,
         post_str,
-        clean_notes,
+        _clean(notes),
+        s.get("sample_rate_hz", ""),
+        s.get("h_scale_s_div",  ""),
+        s.get("trig_type",      ""),
+        s.get("trig_source",    ""),
+        s.get("trig_level_v",   ""),
+        s.get("trig_slope",     ""),
+        s.get("trig_freq_hz",   ""),
+        s.get("acq_mode",       ""),
+        s.get("acq_numavg",     ""),
     ])
     with open(tsv_path, "a", newline="", encoding="utf-8") as fh:
         if write_header:
@@ -409,6 +488,7 @@ def main():
                     print(f"\nCapturing {', '.join(channels)} …")
 
                 scope.write("ACQUIRE:STATE STOP")   # freeze memory — all channels from same trigger
+                scope_state = get_scope_state(scope, channels)
                 captured = {}
                 for ch in channels:
                     print(f"  {ch} … ", end="", flush=True)
@@ -421,8 +501,8 @@ def main():
                         print(f"FAILED ({e})")
 
                 if captured:
-                    save_hdf5(session_file, captured, label=capture_label, notes=notes)
-                    log_capture_tsv(session_file, capture_label, channels, pre, post, notes)
+                    save_hdf5(session_file, captured, label=capture_label, notes=notes, scope_state=scope_state)
+                    log_capture_tsv(session_file, capture_label, channels, pre, post, notes, scope_state=scope_state)
                 else:
                     print("  No data captured — nothing saved.")
                 scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
