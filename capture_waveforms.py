@@ -273,6 +273,86 @@ def save_hdf5(
     print(f"  Saved → {filepath}  (group: {grp_name})")
 
 
+# ── ROOT output ───────────────────────────────────────────────────────────────
+
+# Numeric preamble fields written as per-sample scalar branches in the TTree.
+# Repeated constants compress to near-zero with ROOT's default ZLIB compression.
+_ROOT_PREAMBLE_NUMERICS = ["XINCR", "YMULT", "YOFF", "YZERO", "XZERO", "PT_OFF", "NR_PT"]
+_ROOT_STATE_NUMERICS    = ["sample_rate_hz", "h_scale_s_div", "trig_level_v", "trig_freq_hz"]
+
+
+def save_root(
+    filepath: Path,
+    channels: dict[str, tuple[np.ndarray, np.ndarray, dict]],
+    label: str,
+    scope_state: dict | None = None,
+) -> None:
+    """Save waveform data to a ROOT file (via uproot) alongside the HDF5 output.
+
+    File layout
+    -----------
+    Each channel is stored as a TTree at path ``<label>/<channel>`` inside the
+    ROOT file.  Branches per TTree:
+
+      time_s    float64[N]   — time axis in seconds
+      volts     float64[N]   — voltage axis in volts
+      xincr     float64[N]   — time per sample (s)        ⎫
+      ymult     float64[N]   — ADC voltage scale           ⎪
+      yoff      float64[N]   — ADC offset (ADC counts)     ⎬ WFMPRE scalars,
+      yzero     float64[N]   — voltage zero                ⎪ repeated per sample
+      xzero     float64[N]   — trigger time (s)            ⎪ (compress to ~0)
+      pt_off    float64[N]   — trigger point index         ⎭
+      nr_pt     float64[N]   — full record length (pts)
+      sample_rate_hz  float64[N]  ⎫ scope_state fields
+      h_scale_s_div   float64[N]  ⎪ (omitted when not
+      trig_level_v    float64[N]  ⎪  available)
+      trig_freq_hz    float64[N]  ⎭
+
+    Appending
+    ---------
+    Uses ``uproot.update`` when the ROOT file already exists so that captures
+    from successive calls within a session accumulate in one file, mirroring
+    the HDF5 append behaviour.
+
+    Raises
+    ------
+    ImportError if uproot is not installed.
+    """
+    try:
+        import uproot
+    except ImportError:
+        raise ImportError("uproot is required for ROOT output: pip install uproot")
+
+    root_path = filepath.with_suffix(".root")
+
+    open_fn = uproot.update if root_path.exists() else uproot.recreate
+    with open_fn(root_path) as rf:
+        s = scope_state or {}
+        for ch_name, (time_s, volts, meta) in channels.items():
+            n = len(time_s)
+            branches: dict[str, np.ndarray] = {
+                "time_s": time_s,
+                "volts":  volts,
+            }
+            # Numeric preamble scalars
+            for key in _ROOT_PREAMBLE_NUMERICS:
+                if key in meta:
+                    try:
+                        branches[key.lower()] = np.full(n, float(meta[key]), dtype=np.float64)
+                    except (ValueError, TypeError):
+                        pass
+            # Numeric scope-state scalars
+            for key in _ROOT_STATE_NUMERICS:
+                if key in s:
+                    try:
+                        branches[key] = np.full(n, float(s[key]), dtype=np.float64)
+                    except (ValueError, TypeError):
+                        pass
+            rf[f"{label}/{ch_name}"] = branches
+
+    print(f"  ROOT   → {root_path}  (tree: {label}/<channel>)")
+
+
 # ── Capture log ────────────────────────────────────────────────────────────────
 
 TSV_COLUMNS = [

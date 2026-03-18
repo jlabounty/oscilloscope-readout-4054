@@ -29,7 +29,7 @@ except ImportError:
     import sys; sys.exit("Missing dependency: pip install pyvisa pyvisa-py")
 
 # Import core functions from the existing capture script
-from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5, log_capture_tsv, get_scope_state
+from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5, save_root, log_capture_tsv, get_scope_state
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -121,6 +121,8 @@ class WaveformApp:
         self._axes_map: dict[str, plt.Axes] = {}
         self._line_map: dict[str, plt.Line2D] = {}
         self._n_captures_total = 1
+        self._hist_data: dict[str, dict[str, list]] = {}   # ch → {integral: [], amplitude: []}
+        self._hist_axes: dict[str, dict[str, plt.Axes]] = {}  # ch → {integral: ax, amplitude: ax}
 
         # Tk variables
         self.file_var  = tk.StringVar(value=f"./data/waveforms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5")
@@ -131,6 +133,7 @@ class WaveformApp:
         self.wait_var  = tk.StringVar(value="0")
         self.label_var = tk.StringVar(value="")
         self.notes_var = tk.StringVar(value="")
+        self.root_var  = tk.BooleanVar(value=False)
 
         self._build_ui()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -199,6 +202,9 @@ class WaveformApp:
         btn_row.pack(fill=tk.X)
         tk.Button(btn_row, text="New filename", command=self._on_new_filename).pack(side=tk.LEFT)
         tk.Button(btn_row, text="Browse…", command=self._on_browse).pack(side=tk.RIGHT)
+        tk.Checkbutton(
+            file_frame, text="Also save .root (uproot)", variable=self.root_var,
+        ).pack(anchor="w", pady=(6, 0))
 
         sep()
 
@@ -264,23 +270,51 @@ class WaveformApp:
     def _build_right_panel(self, parent: tk.Frame) -> None:
         right = tk.Frame(parent)
         right.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
-        right.columnconfigure(0, weight=1)
+        right.columnconfigure(0, weight=3)
+        right.columnconfigure(1, weight=2)
         right.rowconfigure(0, weight=1)
 
-        self.fig = plt.Figure(figsize=(8, 5), tight_layout=True)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        # ── Waveforms (left) ───────────────────────────────────────────────────
+        wave_frame = tk.Frame(right)
+        wave_frame.grid(row=0, column=0, sticky="nsew")
+        wave_frame.columnconfigure(0, weight=1)
+        wave_frame.rowconfigure(0, weight=1)
+
+        self.fig = plt.Figure(figsize=(6, 5), tight_layout=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=wave_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        wave_toolbar = tk.Frame(wave_frame)
+        wave_toolbar.grid(row=1, column=0, sticky="ew")
+        NavigationToolbar2Tk(self.canvas, wave_toolbar)
 
-        toolbar_frame = tk.Frame(right)
-        toolbar_frame.grid(row=1, column=0, sticky="ew")
-        NavigationToolbar2Tk(self.canvas, toolbar_frame)
-
-        # Placeholder message
         ax = self.fig.add_subplot(111)
         ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
                 transform=ax.transAxes, color="gray", fontsize=14)
         ax.set_axis_off()
         self.canvas.draw()
+
+        # ── Histograms (right) ─────────────────────────────────────────────────
+        hist_frame = tk.Frame(right)
+        hist_frame.grid(row=0, column=1, sticky="nsew")
+        hist_frame.columnconfigure(0, weight=1)
+        hist_frame.rowconfigure(0, weight=1)
+
+        self.hist_fig = plt.Figure(figsize=(5, 5), tight_layout=True)
+        self.hist_canvas = FigureCanvasTkAgg(self.hist_fig, master=hist_frame)
+        self.hist_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        hist_toolbar_frame = tk.Frame(hist_frame)
+        hist_toolbar_frame.grid(row=1, column=0, sticky="ew")
+        NavigationToolbar2Tk(self.hist_canvas, hist_toolbar_frame)
+        clear_frame = tk.Frame(hist_frame)
+        clear_frame.grid(row=2, column=0, sticky="ew")
+        tk.Button(clear_frame, text="Clear Histograms",
+                  command=self._clear_histograms).pack(side=tk.RIGHT, padx=4, pady=2)
+
+        ax_h = self.hist_fig.add_subplot(111)
+        ax_h.text(0.5, 0.5, "No data yet", ha="center", va="center",
+                  transform=ax_h.transAxes, color="gray", fontsize=14)
+        ax_h.set_axis_off()
+        self.hist_canvas.draw()
 
     # ── Connect ────────────────────────────────────────────────────────────────
 
@@ -357,16 +391,17 @@ class WaveformApp:
             self._set_status(msg, "red")
             return
 
-        channels  = [ch for ch, v in self.ch_vars.items() if v.get()]
-        pre_val   = int(self.pre_var.get())
-        post_val  = int(self.post_var.get())
-        pre_arg   = None if (pre_val == 0 and post_val == 0) else pre_val
-        post_arg  = None if (pre_val == 0 and post_val == 0) else post_val
-        n         = int(self.n_var.get())
-        wait_s    = parse_wait(self.wait_var)
-        filepath  = Path(self.file_var.get().strip())
-        label     = self.label_var.get().strip() or datetime.now().strftime("capture_%H%M%S")
-        notes     = self.notes_var.get().strip()
+        channels   = [ch for ch, v in self.ch_vars.items() if v.get()]
+        pre_val    = int(self.pre_var.get())
+        post_val   = int(self.post_var.get())
+        pre_arg    = None if (pre_val == 0 and post_val == 0) else pre_val
+        post_arg   = None if (pre_val == 0 and post_val == 0) else post_val
+        n          = int(self.n_var.get())
+        wait_s     = parse_wait(self.wait_var)
+        filepath   = Path(self.file_var.get().strip())
+        label      = self.label_var.get().strip() or datetime.now().strftime("capture_%H%M%S")
+        notes      = self.notes_var.get().strip()
+        save_root_ = self.root_var.get()
 
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
@@ -378,7 +413,7 @@ class WaveformApp:
 
         t = threading.Thread(
             target=self._capture_worker,
-            args=(self.scope, channels, pre_arg, post_arg, n, wait_s, filepath, label, notes),
+            args=(self.scope, channels, pre_arg, post_arg, n, wait_s, filepath, label, notes, save_root_),
             daemon=True,
         )
         t.start()
@@ -395,14 +430,15 @@ class WaveformApp:
         filepath: Path,
         label: str,
         notes: str,
+        save_root_: bool = False,
     ) -> None:
         try:
             for i in range(n):
                 if self._stop_event.is_set():
                     self.result_queue.put(("status", "Capture cancelled."))
                     break
-                if i > 0 and wait_s > 0:
-                    deadline = time.monotonic() + wait_s
+                if i > 0 and max(wait_s, 0.1) > 0:
+                    deadline = time.monotonic() + max(wait_s, 0.1)
                     while time.monotonic() < deadline:
                         if self._stop_event.is_set():
                             break
@@ -430,6 +466,8 @@ class WaveformApp:
 
                 if captured:
                     save_hdf5(filepath, captured, label=capture_label, notes=notes, scope_state=scope_state)
+                    if save_root_:
+                        save_root(filepath, captured, label=capture_label, scope_state=scope_state)
                     log_capture_tsv(filepath, capture_label, channels, pre, post, notes, scope_state=scope_state)
                     self.result_queue.put(("capture_done", i + 1, n, str(filepath)))
                 scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
@@ -521,6 +559,31 @@ class WaveformApp:
         self.fig.tight_layout(pad=1.5)
         self.canvas.draw_idle()
 
+        # Reset histogram state for the new capture session
+        self._hist_data = {ch: {"integral": [], "amplitude": []} for ch in channels}
+        self._rebuild_hist_figure(channels)
+
+    def _rebuild_hist_figure(self, channels: list[str]) -> None:
+        """Set up empty histogram axes (2 columns: integral | amplitude, N rows)."""
+        self.hist_fig.clear()
+        self._hist_axes = {}
+        n = len(channels)
+        for i, ch in enumerate(channels):
+            ax_int = self.hist_fig.add_subplot(n, 2, 2 * i + 1)
+            ax_amp = self.hist_fig.add_subplot(n, 2, 2 * i + 2)
+            for ax, title, xlabel in [
+                (ax_int, f"{ch} — Integral",  "Integral (V·s)"),
+                (ax_amp, f"{ch} — Amplitude", "Amplitude (V)"),
+            ]:
+                ax.set_title(title, loc="left", fontsize=8, fontweight="bold")
+                ax.set_xlabel(xlabel, fontsize=8)
+                ax.set_ylabel("Counts", fontsize=8)
+                ax.tick_params(labelsize=7)
+                ax.grid(True, alpha=0.3, linewidth=0.5)
+            self._hist_axes[ch] = {"integral": ax_int, "amplitude": ax_amp}
+        self.hist_fig.tight_layout(pad=1.5)
+        self.hist_canvas.draw_idle()
+
     def _update_plot(
         self,
         ch: str,
@@ -563,6 +626,70 @@ class WaveformApp:
         ax.autoscale_view()
         ax.set_xlabel(f"Time ({t_prefix}s)")
         self.canvas.draw_idle()
+
+        # Accumulate histogram data
+        if ch in self._hist_data:
+            integral, amplitude = self._compute_pulse_metrics(time_s, volts, meta)
+            self._hist_data[ch]["integral"].append(integral)
+            self._hist_data[ch]["amplitude"].append(amplitude)
+            self._update_histograms(ch)
+
+    def _compute_pulse_metrics(
+        self,
+        time_s: np.ndarray,
+        volts: np.ndarray,
+        meta: dict,
+    ) -> tuple[float, float]:
+        """Return (baseline-subtracted integral in V·s, peak amplitude in V).
+
+        Baseline is the mean of pre-trigger samples (time_s < XZERO).
+        Falls back to the first 10 % of samples if no pre-trigger region exists.
+        """
+        xzero = float(meta.get("XZERO", 0.0))
+        pre_mask = time_s < xzero
+        if pre_mask.sum() >= 5:
+            baseline = volts[pre_mask].mean()
+        else:
+            n_base = max(1, len(volts) // 10)
+            baseline = volts[:n_base].mean()
+        bsub = volts - baseline
+        integral  = float(np.trapezoid(bsub, time_s))
+        amplitude = float(bsub.max())
+        return integral, amplitude
+
+    def _update_histograms(self, ch: str) -> None:
+        """Redraw the integral and amplitude histograms for one channel."""
+        axes = self._hist_axes.get(ch)
+        if axes is None:
+            return
+        data = self._hist_data.get(ch, {})
+        for key, ax in axes.items():
+            values = data.get(key, [])
+            ax.clear()
+            xlabel = "Integral (V·s)" if key == "integral" else "Amplitude (V)"
+            ax.set_title(
+                f"{ch} — {'Integral' if key == 'integral' else 'Amplitude'}  (n={len(values)})",
+                loc="left", fontsize=8, fontweight="bold",
+            )
+            ax.set_xlabel(xlabel, fontsize=8)
+            ax.set_ylabel("Counts", fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.3, linewidth=0.5)
+            if values:
+                ax.hist(values, bins=min(50, max(10, len(values))), color="#1a6fbf",
+                        edgecolor="white", linewidth=0.4)
+                ax.relim()
+                ax.autoscale_view()
+        self.hist_fig.tight_layout(pad=1.5)
+        self.hist_canvas.draw_idle()
+
+    def _clear_histograms(self) -> None:
+        """Wipe accumulated histogram data and redraw empty axes."""
+        for ch in self._hist_data:
+            self._hist_data[ch] = {"integral": [], "amplitude": []}
+        channels = list(self._hist_axes.keys())
+        if channels:
+            self._rebuild_hist_figure(channels)
 
     # ── Status / indicators ────────────────────────────────────────────────────
 
