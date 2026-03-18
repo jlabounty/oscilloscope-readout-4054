@@ -25,6 +25,23 @@ On the oscilloscope: `Utility > I/O > USB Network & PC` → set to **USB Device*
 
 ## Usage
 
+### GUI (recommended)
+
+```bash
+python capture_gui.py
+```
+
+Opens an interactive window with:
+
+- **Connect to Scope / Disconnect** — scans USB and connects; coloured indicator shows connection state (red/yellow/green); Disconnect closes the VISA session cleanly
+- **Output File** — path for the `.h5` output file, with Browse and New Filename buttons (New Filename stamps the current time)
+- **Channels** — checkboxes for CH1–CH4
+- **Trigger Window** — pre/post-trigger sample counts (`0 0` = full record)
+- **Capture Options** — number of captures, wait time between captures (seconds, default 0), capture label, notes
+- **Capture** — starts acquisition; waveforms are plotted live as each channel is digitized; a red dashed trigger line is overlaid at t = 0 (XZERO); multiple captures are overlaid using the viridis colormap
+
+### CLI
+
 ```bash
 python capture_waveforms.py
 ```
@@ -35,11 +52,14 @@ The script will:
 2. Prompt for an output `.h5` file (default: timestamped filename)
 3. Loop — for each capture:
    - Select channels (`1 2` or `1 2 3 4`, etc.)
-   - Enter a capture label (e.g. `run3_signal`)
+   - Enter pre/post trigger window sample counts
+   - Enter number of captures and a capture label
    - Enter optional notes
    - Capture and save, then prompt to capture again
 
-## HDF5 output format
+## Output files
+
+### HDF5 waveform data
 
 Multiple captures in one session are appended as separate groups in the same file:
 
@@ -58,16 +78,33 @@ Reading the output in Python:
 ```python
 import h5py, numpy as np
 
-with h5py.File("waveforms_20250318_142301.h5", "r") as f:
+with h5py.File("waveforms_20260318_142301.h5", "r") as f:
     t = f["run3_signal/CH1/time_s"][:]
     v = f["run3_signal/CH1/volts"][:]
     yunit = f["run3_signal/CH1/volts"].attrs["units"]   # 'V'
     xunit = f["run3_signal/CH1/time_s"].attrs["units"]  # 's'
 ```
 
+### TSV capture log
+
+Every successful capture appends one row to a TSV file alongside the HDF5 file (same path, `.tsv` extension). A header row is written automatically on first use.
+
+Columns:
+
+| Column | Description |
+|---|---|
+| `timestamp` | ISO-8601 timestamp of the save |
+| `capture_label` | HDF5 group name for this capture |
+| `hdf5_file` | Absolute path to the HDF5 file |
+| `channels` | Comma-separated channel list (e.g. `CH1,CH2`) |
+| `pre_samples` | Pre-trigger samples, or `full` |
+| `post_samples` | Post-trigger samples, or `full` |
+| `notes` | Free-text notes |
+
 ## Notes
 
 - Transfer uses signed 16-bit binary encoding (`RIBINARY`) for speed — much faster than ASCII at long record lengths
-- All datasets are gzip-compressed
+- All HDF5 datasets are gzip-compressed
 - Physical-unit scaling is applied from the WFMPRE preamble: `volts = (raw - YOFF) * YMULT + YZERO`
+- Memory is frozen with `ACQUIRE:STATE STOP` before reading all channels, ensuring every channel comes from the same trigger event; acquisition is re-armed with `ACQUIRE:STATE RUN` afterwards
 - Programmer reference: Tektronix MSO4000/DPO4000 Series Programmer Manual (077-0248-01)

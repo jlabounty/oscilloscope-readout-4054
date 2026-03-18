@@ -29,7 +29,7 @@ except ImportError:
     import sys; sys.exit("Missing dependency: pip install pyvisa pyvisa-py")
 
 # Import core functions from the existing capture script
-from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5
+from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5, log_capture_tsv
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -96,6 +96,15 @@ def validate_inputs(
     return True, ""
 
 
+def parse_wait(wait_var: tk.StringVar) -> float:
+    """Return wait seconds (>=0), or 0.0 on invalid/empty input."""
+    try:
+        v = float(wait_var.get())
+        return max(v, 0.0)
+    except ValueError:
+        return 0.0
+
+
 # ── Main application ────────────────────────────────────────────────────────────
 
 CHANNEL_NAMES = ["CH1", "CH2", "CH3", "CH4"]
@@ -119,6 +128,7 @@ class WaveformApp:
         self.pre_var   = tk.StringVar(value="1000")
         self.post_var  = tk.StringVar(value="1000")
         self.n_var     = tk.StringVar(value="1")
+        self.wait_var  = tk.StringVar(value="0")
         self.label_var = tk.StringVar(value="")
         self.notes_var = tk.StringVar(value="")
 
@@ -172,12 +182,23 @@ class WaveformApp:
         )
         self.connect_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        disc_row = tk.Frame(conn_frame)
+        disc_row.pack(fill=tk.X, pady=(4, 0))
+        self.disconnect_btn = tk.Button(
+            disc_row, text="Disconnect", command=self._on_disconnect,
+            state=tk.DISABLED,
+        )
+        self.disconnect_btn.pack(fill=tk.X)
+
         sep()
 
         # -- OUTPUT FILE --
         file_frame = section("Output File")
         tk.Entry(file_frame, textvariable=self.file_var).pack(fill=tk.X, pady=(0, 4))
-        tk.Button(file_frame, text="Browse…", command=self._on_browse).pack(anchor="e")
+        btn_row = tk.Frame(file_frame)
+        btn_row.pack(fill=tk.X)
+        tk.Button(btn_row, text="New filename", command=self._on_new_filename).pack(side=tk.LEFT)
+        tk.Button(btn_row, text="Browse…", command=self._on_browse).pack(side=tk.RIGHT)
 
         sep()
 
@@ -206,9 +227,10 @@ class WaveformApp:
         # -- CAPTURE OPTIONS --
         cap_frame = section("Capture Options")
         rows = [
-            ("Number of captures", self.n_var),
-            ("Capture label",      self.label_var),
-            ("Notes",              self.notes_var),
+            ("Number of captures",      self.n_var),
+            ("Wait between captures (s)", self.wait_var),
+            ("Capture label",            self.label_var),
+            ("Notes",                    self.notes_var),
         ]
         for lbl, var in rows:
             row = tk.Frame(cap_frame)
@@ -294,7 +316,21 @@ class WaveformApp:
         idn = scope.query("*IDN?").strip() if scope else "?"
         self.result_queue.put(("connected", scope, idn))
 
+    def _on_disconnect(self) -> None:
+        if self.scope is not None:
+            try:
+                self.scope.close()
+            except Exception:
+                pass
+            self.scope = None
+        self._set_conn_indicator("disconnected")
+        self._set_status("Disconnected.")
+        self.disconnect_btn.config(state=tk.DISABLED)
+
     # ── Browse ─────────────────────────────────────────────────────────────────
+
+    def _on_new_filename(self) -> None:
+        self.file_var.set(f"./data/waveforms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5")
 
     def _on_browse(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -327,6 +363,7 @@ class WaveformApp:
         pre_arg   = None if (pre_val == 0 and post_val == 0) else pre_val
         post_arg  = None if (pre_val == 0 and post_val == 0) else post_val
         n         = int(self.n_var.get())
+        wait_s    = parse_wait(self.wait_var)
         filepath  = Path(self.file_var.get().strip())
         label     = self.label_var.get().strip() or datetime.now().strftime("capture_%H%M%S")
         notes     = self.notes_var.get().strip()
@@ -341,7 +378,7 @@ class WaveformApp:
 
         t = threading.Thread(
             target=self._capture_worker,
-            args=(self.scope, channels, pre_arg, post_arg, n, filepath, label, notes),
+            args=(self.scope, channels, pre_arg, post_arg, n, wait_s, filepath, label, notes),
             daemon=True,
         )
         t.start()
@@ -354,6 +391,7 @@ class WaveformApp:
         pre,
         post,
         n: int,
+        wait_s: float,
         filepath: Path,
         label: str,
         notes: str,
@@ -363,6 +401,19 @@ class WaveformApp:
                 if self._stop_event.is_set():
                     self.result_queue.put(("status", "Capture cancelled."))
                     break
+                if i > 0 and wait_s > 0:
+                    deadline = time.monotonic() + wait_s
+                    while time.monotonic() < deadline:
+                        if self._stop_event.is_set():
+                            break
+                        remaining = deadline - time.monotonic()
+                        self.result_queue.put(
+                            ("status", f"Waiting… {remaining:.1f} s before capture {i+1}/{n}")
+                        )
+                        time.sleep(min(0.1, remaining))
+                    if self._stop_event.is_set():
+                        self.result_queue.put(("status", "Capture cancelled."))
+                        break
                 capture_label = f"{label}_{i+1:03d}" if n > 1 else label
                 scope.write("ACQUIRE:STATE STOP")   # freeze memory — all channels from same trigger
                 captured = {}
@@ -378,6 +429,7 @@ class WaveformApp:
 
                 if captured:
                     save_hdf5(filepath, captured, label=capture_label, notes=notes)
+                    log_capture_tsv(filepath, capture_label, channels, pre, post, notes)
                     self.result_queue.put(("capture_done", i + 1, n, str(filepath)))
                 scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
 
@@ -402,6 +454,7 @@ class WaveformApp:
                     self._set_conn_indicator("connected")
                     self._set_status(f"Connected: {idn}")
                     self.connect_btn.config(state=tk.NORMAL)
+                    self.disconnect_btn.config(state=tk.NORMAL)
                     done = True
 
                 elif kind == "connect_error":
@@ -409,14 +462,15 @@ class WaveformApp:
                     self._set_conn_indicator("disconnected")
                     self._set_status(f"Connection failed: {err}", "red")
                     self.connect_btn.config(state=tk.NORMAL)
+                    self.disconnect_btn.config(state=tk.DISABLED)
                     done = True
 
                 elif kind == "status":
                     self._set_status(msg[1])
 
                 elif kind == "channel_done":
-                    _, cap_idx, ch, time_s, volts, _meta = msg
-                    self._update_plot(ch, time_s, volts, cap_idx)
+                    _, cap_idx, ch, time_s, volts, meta = msg
+                    self._update_plot(ch, time_s, volts, cap_idx, meta)
 
                 elif kind == "capture_done":
                     _, completed, total, path = msg
@@ -427,12 +481,18 @@ class WaveformApp:
                     self._set_status(f"Error: {err}", "red")
                     self._capture_running = False
                     self._set_controls_enabled(True)
+                    self.disconnect_btn.config(
+                        state=tk.NORMAL if self.scope is not None else tk.DISABLED
+                    )
                     done = True
 
                 elif kind == "all_done":
                     self._set_status("Done.")
                     self._capture_running = False
                     self._set_controls_enabled(True)
+                    self.disconnect_btn.config(
+                        state=tk.NORMAL if self.scope is not None else tk.DISABLED
+                    )
                     done = True
 
         except queue.Empty:
@@ -460,7 +520,14 @@ class WaveformApp:
         self.fig.tight_layout(pad=1.5)
         self.canvas.draw_idle()
 
-    def _update_plot(self, ch: str, time_s: np.ndarray, volts: np.ndarray, capture_idx: int) -> None:
+    def _update_plot(
+        self,
+        ch: str,
+        time_s: np.ndarray,
+        volts: np.ndarray,
+        capture_idx: int,
+        meta: dict,
+    ) -> None:
         ax   = self._axes_map.get(ch)
         line = self._line_map.get(ch)
         if ax is None:
@@ -476,6 +543,18 @@ class WaveformApp:
             line.set_xdata(t_scaled)
             line.set_ydata(volts)
             line.set_color(color)
+
+            # Trigger line — drawn once per channel (XZERO is the trigger time in seconds)
+            xzero = float(meta.get("XZERO", 0.0))
+            ax.axvline(
+                x=xzero * t_scale,
+                color="red",
+                linewidth=0.9,
+                linestyle="--",
+                alpha=0.7,
+                label="trigger",
+                zorder=3,
+            )
         else:
             ax.plot(t_scaled, volts, lw=0.9, alpha=0.85, color=color)
 

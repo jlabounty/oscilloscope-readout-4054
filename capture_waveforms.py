@@ -15,7 +15,6 @@ On Linux, you may also need:
 
 import sys
 import time
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -84,13 +83,18 @@ def get_preamble(scope: pyvisa.Resource) -> dict:
     """Fetch and parse the WFMPRE preamble for the currently selected source."""
     raw = scope.query("WFMPRE?").strip()
     preamble = {}
-    # Preamble fields are colon-separated key:value pairs, comma-delimited
-    # e.g.  BYT_NR 1;BIT_NR 8;ENCDG RIB; ...  (semicolon-separated on DPO4k)
-    for field in re.split(r"[;,]", raw):
+    # Fields are semicolon-separated: WFMPRE:BYT_NR 2;BIT_NR 16;...;WFID "Ch1, DC...";PT_OFF 0;...
+    # Split only on ";" — the WFID value contains commas and must not be split.
+    # The first field carries a "WFMPRE:" header prefix that must be stripped.
+    for field in raw.split(";"):
         field = field.strip()
-        if " " in field:
-            k, v = field.split(" ", 1)
-            preamble[k.upper()] = v.strip('"')
+        if " " not in field:
+            continue
+        k, v = field.split(" ", 1)
+        k = k.upper()
+        if ":" in k:                        # strip e.g. "WFMPRE:" prefix
+            k = k.rsplit(":", 1)[-1]
+        preamble[k] = v.strip('"')
     return preamble
 
 
@@ -212,6 +216,49 @@ def save_hdf5(
     print(f"  Saved → {filepath}  (group: {grp_name})")
 
 
+# ── Capture log ────────────────────────────────────────────────────────────────
+
+TSV_COLUMNS = [
+    "timestamp", "capture_label", "hdf5_file",
+    "channels", "pre_samples", "post_samples", "notes",
+]
+
+def log_capture_tsv(
+    filepath: Path,
+    label: str,
+    channels: list[str],
+    pre_samples: int | None,
+    post_samples: int | None,
+    notes: str = "",
+) -> None:
+    """Append one row to a TSV log file co-located with the HDF5 output.
+
+    The TSV file has the same path as *filepath* but with a .tsv extension.
+    A header row is written automatically the first time the file is created.
+    Tab and newline characters in *notes* are collapsed to spaces so the row
+    stays on a single line.
+    """
+    tsv_path = filepath.with_suffix(".tsv")
+    write_header = not tsv_path.exists()
+    pre_str  = str(pre_samples)  if pre_samples  is not None else "full"
+    post_str = str(post_samples) if post_samples is not None else "full"
+    clean_notes = notes.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    row = "\t".join([
+        datetime.now().isoformat(),
+        label,
+        str(filepath.resolve()),
+        ",".join(channels),
+        pre_str,
+        post_str,
+        clean_notes,
+    ])
+    with open(tsv_path, "a", newline="", encoding="utf-8") as fh:
+        if write_header:
+            fh.write("\t".join(TSV_COLUMNS) + "\n")
+        fh.write(row + "\n")
+    print(f"  Log    → {tsv_path}")
+
+
 # ── CLI helpers ────────────────────────────────────────────────────────────────
 
 VALID_CHANNELS = {"CH1", "CH2", "CH3", "CH4"}
@@ -241,6 +288,19 @@ def prompt_filepath() -> Path:
     if path.suffix.lower() not in {".h5", ".hdf5"}:
         path = path.with_suffix(".h5")
     return path
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds with an appropriate SI prefix."""
+    for threshold, scale, unit in [
+        (1e-9, 1e12, "ps"),
+        (1e-6, 1e9,  "ns"),
+        (1e-3, 1e6,  "µs"),
+        (1.0,  1e3,  "ms"),
+    ]:
+        if abs(seconds) < threshold:
+            return f"{seconds * scale:.1f} {unit}"
+    return f"{seconds:.3f} s"
 
 
 def prompt_label() -> str:
@@ -348,6 +408,7 @@ def main():
                     capture_label = label
                     print(f"\nCapturing {', '.join(channels)} …")
 
+                scope.write("ACQUIRE:STATE STOP")   # freeze memory — all channels from same trigger
                 captured = {}
                 for ch in channels:
                     print(f"  {ch} … ", end="", flush=True)
@@ -355,15 +416,16 @@ def main():
                         time_s, volts, meta = fetch_channel(scope, ch, pre, post)
                         captured[ch] = (time_s, volts, meta)
                         n_pts = len(volts)
-                        duration_us = (time_s[-1] - time_s[0]) * 1e6
-                        print(f"{n_pts:,} pts  |  {duration_us:.1f} µs window")
+                        print(f"{n_pts:,} pts  |  {_fmt_duration(time_s[-1] - time_s[0])} window")
                     except Exception as e:
                         print(f"FAILED ({e})")
 
                 if captured:
                     save_hdf5(session_file, captured, label=capture_label, notes=notes)
+                    log_capture_tsv(session_file, capture_label, channels, pre, post, notes)
                 else:
                     print("  No data captured — nothing saved.")
+                scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
 
             if not prompt_yes_no("\nCapture again?", default=True):
                 break
