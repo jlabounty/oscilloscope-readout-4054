@@ -79,22 +79,25 @@ PREAMBLE_KEYS = [
     "XZERO", "XUNIT", "YMULT", "YOFF", "YZERO", "YUNIT"
 ]
 
+_PREAMBLE_FIELDS = [
+    "BYT_NR", "BIT_NR", "ENCDG", "BN_FMT", "BYT_OR",
+    "NR_PT",  "WFID",   "PT_FMT", "XUNIT",  "XINCR",
+    "PT_OFF", "XZERO",  "YMULT",  "YOFF",   "YZERO",  "YUNIT",
+]
+
 def get_preamble(scope: pyvisa.Resource) -> dict:
-    """Fetch and parse the WFMPRE preamble for the currently selected source."""
-    raw = scope.query("WFMPRE?").strip()
+    """Fetch the WFMPRE preamble for the currently selected source.
+
+    Queries each field individually (e.g. WFMPRE:YMULT?) rather than
+    parsing the bulk WFMPRE? response, which on some DPO4054 firmware
+    versions returns only the WFID string instead of the full record.
+    """
     preamble = {}
-    # Fields are semicolon-separated: WFMPRE:BYT_NR 2;BIT_NR 16;...;WFID "Ch1, DC...";PT_OFF 0;...
-    # Split only on ";" — the WFID value contains commas and must not be split.
-    # The first field carries a "WFMPRE:" header prefix that must be stripped.
-    for field in raw.split(";"):
-        field = field.strip()
-        if " " not in field:
-            continue
-        k, v = field.split(" ", 1)
-        k = k.upper()
-        if ":" in k:                        # strip e.g. "WFMPRE:" prefix
-            k = k.rsplit(":", 1)[-1]
-        preamble[k] = v.strip('"')
+    for key in _PREAMBLE_FIELDS:
+        try:
+            preamble[key] = scope.query(f"WFMPRE:{key}?").strip().strip('"')
+        except Exception:
+            pass
     return preamble
 
 
