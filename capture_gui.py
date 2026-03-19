@@ -79,12 +79,12 @@ def validate_inputs(
         return False, "Output file must have .h5 or .hdf5 extension."
 
     try:
-        pre = int(pre_var.get())
-        post = int(post_var.get())
+        pre = float(pre_var.get())
+        post = float(post_var.get())
         if pre < 0 or post < 0:
             raise ValueError
     except ValueError:
-        return False, "Pre/post samples must be non-negative integers."
+        return False, "Pre/post times must be non-negative numbers."
 
     try:
         n = int(n_var.get())
@@ -109,6 +109,7 @@ def parse_wait(wait_var: tk.StringVar) -> float:
 
 CHANNEL_NAMES = ["CH1", "CH2", "CH3", "CH4"]
 POLL_MS = 50
+HIST_REFRESH_S = 2.0   # minimum seconds between histogram redraws
 
 
 class WaveformApp:
@@ -121,6 +122,9 @@ class WaveformApp:
         self._axes_map: dict[str, plt.Axes] = {}
         self._line_map: dict[str, plt.Line2D] = {}
         self._n_captures_total = 1
+        self._plot_dirty = False
+        self._hist_dirty = False
+        self._last_hist_draw = 0.0   # time.monotonic() of last histogram redraw
         self._hist_data: dict[str, dict[str, list]] = {}   # ch → {integral: [], amplitude: []}
         self._hist_axes: dict[str, dict[str, plt.Axes]] = {}  # ch → {integral: ax, amplitude: ax}
 
@@ -221,7 +225,7 @@ class WaveformApp:
 
         # -- TRIGGER WINDOW --
         trig_frame = section("Trigger Window")
-        for lbl, var in [("Pre-trigger samples", self.pre_var), ("Post-trigger samples", self.post_var)]:
+        for lbl, var in [("Time before trigger (ns)", self.pre_var), ("Time after trigger (ns)", self.post_var)]:
             row = tk.Frame(trig_frame)
             row.pack(fill=tk.X, pady=2)
             tk.Label(row, text=lbl, width=20, anchor="w").pack(side=tk.LEFT)
@@ -259,6 +263,20 @@ class WaveformApp:
             command=self._on_capture,
         )
         self.capture_btn.pack(fill=tk.X, pady=(4, 0))
+
+        self.stop_btn = tk.Button(
+            left,
+            text="Stop",
+            font=("", 11, "bold"),
+            bg="#bf1a1a",
+            fg="white",
+            activebackground="#991515",
+            activeforeground="white",
+            pady=5,
+            state=tk.DISABLED,
+            command=self._on_stop,
+        )
+        self.stop_btn.pack(fill=tk.X, pady=(4, 0))
 
         # Keep a list of all input widgets for bulk enable/disable
         self._input_widgets = [
@@ -392,10 +410,10 @@ class WaveformApp:
             return
 
         channels   = [ch for ch, v in self.ch_vars.items() if v.get()]
-        pre_val    = int(self.pre_var.get())
-        post_val   = int(self.post_var.get())
-        pre_arg    = None if (pre_val == 0 and post_val == 0) else pre_val
-        post_arg   = None if (pre_val == 0 and post_val == 0) else post_val
+        pre_ns     = float(self.pre_var.get())
+        post_ns    = float(self.post_var.get())
+        pre_arg    = None if (pre_ns == 0 and post_ns == 0) else pre_ns
+        post_arg   = None if (pre_ns == 0 and post_ns == 0) else post_ns
         n          = int(self.n_var.get())
         wait_s     = parse_wait(self.wait_var)
         filepath   = Path(self.file_var.get().strip())
@@ -409,6 +427,7 @@ class WaveformApp:
         self._capture_running  = True
         self._stop_event.clear()
         self._set_controls_enabled(False)
+        self.stop_btn.config(state=tk.NORMAL)
         self._rebuild_figure(channels)
 
         t = threading.Thread(
@@ -418,6 +437,11 @@ class WaveformApp:
         )
         t.start()
         self.root.after(POLL_MS, self._poll_result_queue)
+
+    def _on_stop(self) -> None:
+        self._stop_event.set()
+        self.stop_btn.config(state=tk.DISABLED)
+        self._set_status("Stopping after current channel…")
 
     def _capture_worker(
         self,
@@ -432,21 +456,39 @@ class WaveformApp:
         notes: str,
         save_root_: bool = False,
     ) -> None:
+        # pre/post are None (full record) or floats in nanoseconds.
+        # Always fetch the full record; slice to the requested time window
+        # afterwards using the time axis (which already has t=0 at the trigger).
+
         try:
+            n_acq_before = -1   # sentinel; updated after each capture before RUN
             for i in range(n):
                 if self._stop_event.is_set():
                     self.result_queue.put(("status", "Capture cancelled."))
                     break
-                if i > 0 and max(wait_s, 0.1) > 0:
-                    deadline = time.monotonic() + max(wait_s, 0.1)
-                    while time.monotonic() < deadline:
-                        if self._stop_event.is_set():
+                # Wait until scope has a fresh trigger (and user's wait_s minimum has elapsed)
+                if i > 0:
+                    t_start = time.monotonic()
+                    while not self._stop_event.is_set():
+                        elapsed = time.monotonic() - t_start
+                        try:
+                            new_data = int(scope.query("ACQUIRE:NUMACQ?").strip()) > n_acq_before
+                        except Exception:
+                            new_data = True   # degrade gracefully if query fails
+                        if new_data and elapsed >= wait_s:
                             break
-                        remaining = deadline - time.monotonic()
-                        self.result_queue.put(
-                            ("status", f"Waiting… {remaining:.1f} s before capture {i+1}/{n}")
-                        )
-                        time.sleep(min(0.1, remaining))
+                        if new_data:
+                            self.result_queue.put((
+                                "status",
+                                f"Capture {i+1}/{n} — new trigger ready, "
+                                f"waiting {wait_s - elapsed:.1f}s more…",
+                            ))
+                        else:
+                            self.result_queue.put((
+                                "status",
+                                f"Capture {i+1}/{n} — waiting for new trigger… ({elapsed:.1f}s)",
+                            ))
+                        time.sleep(0.05)
                     if self._stop_event.is_set():
                         self.result_queue.put(("status", "Capture cancelled."))
                         break
@@ -460,7 +502,11 @@ class WaveformApp:
                     self.result_queue.put(
                         ("status", f"Capture {i+1}/{n} — fetching {ch}…")
                     )
-                    time_s, volts, meta = fetch_channel(scope, ch, pre, post)
+                    time_s, volts, meta = fetch_channel(scope, ch, None, None)
+                    if pre is not None:
+                        mask   = (time_s >= -pre * 1e-9) & (time_s <= post * 1e-9)
+                        time_s = time_s[mask]
+                        volts  = volts[mask]
                     captured[ch] = (time_s, volts, meta)
                     self.result_queue.put(("channel_done", i, ch, time_s, volts, meta))
 
@@ -470,6 +516,10 @@ class WaveformApp:
                         save_root(filepath, captured, label=capture_label, scope_state=scope_state)
                     log_capture_tsv(filepath, capture_label, channels, pre, post, notes, scope_state=scope_state)
                     self.result_queue.put(("capture_done", i + 1, n, str(filepath)))
+                try:
+                    n_acq_before = int(scope.query("ACQUIRE:NUMACQ?").strip())
+                except Exception:
+                    n_acq_before = -1   # skip poll on next iteration
                 scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
 
         except Exception as e:
@@ -520,6 +570,7 @@ class WaveformApp:
                     self._set_status(f"Error: {err}", "red")
                     self._capture_running = False
                     self._set_controls_enabled(True)
+                    self.stop_btn.config(state=tk.DISABLED)
                     self.disconnect_btn.config(
                         state=tk.NORMAL if self.scope is not None else tk.DISABLED
                     )
@@ -529,6 +580,7 @@ class WaveformApp:
                     self._set_status("Done.")
                     self._capture_running = False
                     self._set_controls_enabled(True)
+                    self.stop_btn.config(state=tk.DISABLED)
                     self.disconnect_btn.config(
                         state=tk.NORMAL if self.scope is not None else tk.DISABLED
                     )
@@ -536,6 +588,19 @@ class WaveformApp:
 
         except queue.Empty:
             pass
+
+        # ── Flush renders once per poll cycle ──────────────────────────────────
+        if self._plot_dirty:
+            self.canvas.draw_idle()
+            self._plot_dirty = False
+
+        now = time.monotonic()
+        force_hist = done and self._hist_dirty
+        if self._hist_dirty and (force_hist or (now - self._last_hist_draw) >= HIST_REFRESH_S):
+            self._redraw_all_histograms()
+            self.hist_canvas.draw_idle()
+            self._hist_dirty = False
+            self._last_hist_draw = now
 
         if not done:
             self.root.after(POLL_MS, self._poll_result_queue)
@@ -608,10 +673,9 @@ class WaveformApp:
             line.set_ydata(volts)
             line.set_color(color)
 
-            # Trigger line — drawn once per channel (XZERO is the trigger time in seconds)
-            xzero = float(meta.get("XZERO", 0.0))
+            # Trigger line at t=0
             ax.axvline(
-                x=xzero * t_scale,
+                x=0,
                 color="red",
                 linewidth=0.9,
                 linestyle="--",
@@ -625,14 +689,12 @@ class WaveformApp:
         ax.relim()
         ax.autoscale_view()
         ax.set_xlabel(f"Time ({t_prefix}s)")
-        self.canvas.draw_idle()
+        self._plot_dirty = True
 
-        # Accumulate histogram data
-        if ch in self._hist_data:
-            integral, amplitude = self._compute_pulse_metrics(time_s, volts, meta)
-            self._hist_data[ch]["integral"].append(integral)
-            self._hist_data[ch]["amplitude"].append(amplitude)
-            self._update_histograms(ch)
+        # Accumulate histogram data (rendering is deferred to _poll_result_queue)
+        integral, amplitude = self._compute_pulse_metrics(time_s, volts, meta)
+        self._accumulate_hist(ch, integral, amplitude)
+        self._hist_dirty = True
 
     def _compute_pulse_metrics(
         self,
@@ -657,8 +719,15 @@ class WaveformApp:
         amplitude = float(bsub.max())
         return integral, amplitude
 
-    def _update_histograms(self, ch: str) -> None:
-        """Redraw the integral and amplitude histograms for one channel."""
+    def _accumulate_hist(self, ch: str, integral: float, amplitude: float) -> None:
+        """Append one capture's metrics to the histogram data store (no rendering)."""
+        if ch in self._hist_data:
+            self._hist_data[ch]["integral"].append(integral)
+            self._hist_data[ch]["amplitude"].append(amplitude)
+
+    def _redraw_hist_for_channel(self, ch: str) -> None:
+        """Redraw histogram axes for one channel. Caller is responsible for
+        tight_layout and draw_idle — do not call them here."""
         axes = self._hist_axes.get(ch)
         if axes is None:
             return
@@ -680,8 +749,13 @@ class WaveformApp:
                         edgecolor="white", linewidth=0.4)
                 ax.relim()
                 ax.autoscale_view()
+
+    def _redraw_all_histograms(self) -> None:
+        """Redraw all channel histograms in one pass, call tight_layout once,
+        and queue a single draw. Called at most every HIST_REFRESH_S seconds."""
+        for ch in list(self._hist_axes):
+            self._redraw_hist_for_channel(ch)
         self.hist_fig.tight_layout(pad=1.5)
-        self.hist_canvas.draw_idle()
 
     def _clear_histograms(self) -> None:
         """Wipe accumulated histogram data and redraw empty axes."""
