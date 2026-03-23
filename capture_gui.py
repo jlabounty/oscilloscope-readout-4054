@@ -129,7 +129,9 @@ class WaveformApp:
         self._hist_axes: dict[str, dict[str, plt.Axes]] = {}  # ch → {integral: ax, amplitude: ax}
 
         # Tk variables
-        self.file_var  = tk.StringVar(value=f"./data/waveforms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5")
+        self.prefix_var = tk.StringVar(value="waveforms")
+        self._ts_str    = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.file_var   = tk.StringVar()
         self.ch_vars   = {ch: tk.BooleanVar(value=(ch == "CH1")) for ch in CHANNEL_NAMES}
         self.pre_var   = tk.StringVar(value="1000")
         self.post_var  = tk.StringVar(value="1000")
@@ -138,6 +140,9 @@ class WaveformApp:
         self.label_var = tk.StringVar(value="")
         self.notes_var = tk.StringVar(value="")
         self.root_var  = tk.BooleanVar(value=False)
+
+        self.file_var.set(self._compute_filename())
+        self.prefix_var.trace_add("write", lambda *_: self._update_filename_preview())
 
         self._build_ui()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -201,11 +206,19 @@ class WaveformApp:
 
         # -- OUTPUT FILE --
         file_frame = section("Output File")
-        tk.Entry(file_frame, textvariable=self.file_var).pack(fill=tk.X, pady=(0, 4))
+        prefix_row = tk.Frame(file_frame)
+        prefix_row.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(prefix_row, text="Prefix", width=7, anchor="w").pack(side=tk.LEFT)
+        tk.Entry(prefix_row, textvariable=self.prefix_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
         btn_row = tk.Frame(file_frame)
         btn_row.pack(fill=tk.X)
         tk.Button(btn_row, text="New filename", command=self._on_new_filename).pack(side=tk.LEFT)
         tk.Button(btn_row, text="Browse…", command=self._on_browse).pack(side=tk.RIGHT)
+        preview_row = tk.Frame(file_frame)
+        preview_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(preview_row, text="Output file:", anchor="w").pack(anchor="w")
+        self._preview_entry = ttk.Entry(preview_row, textvariable=self.file_var, state="readonly")
+        self._preview_entry.pack(fill=tk.X)
         tk.Checkbutton(
             file_frame, text="Also save .root (uproot)", variable=self.root_var,
         ).pack(anchor="w", pady=(6, 0))
@@ -381,8 +394,16 @@ class WaveformApp:
 
     # ── Browse ─────────────────────────────────────────────────────────────────
 
+    def _compute_filename(self) -> str:
+        prefix = self.prefix_var.get().strip() or "waveforms"
+        return f"./data/{prefix}_{self._ts_str}.h5"
+
+    def _update_filename_preview(self) -> None:
+        self.file_var.set(self._compute_filename())
+
     def _on_new_filename(self) -> None:
-        self.file_var.set(f"./data/waveforms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5")
+        self._ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._update_filename_preview()
 
     def _on_browse(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -792,6 +813,8 @@ class WaveformApp:
 
         # Always keep status bar label readable
         self.status_label.config(state=tk.NORMAL)
+        # Preview entry must stay readonly regardless of capture state
+        self._preview_entry.config(state="readonly")
 
     # ── Close ──────────────────────────────────────────────────────────────────
 
