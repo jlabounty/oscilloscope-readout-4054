@@ -399,6 +399,7 @@ class WaveformApp:
         return f"./data/{prefix}_{self._ts_str}.h5"
 
     def _update_filename_preview(self) -> None:
+        self._ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.file_var.set(self._compute_filename())
 
     def _on_new_filename(self) -> None:
@@ -728,6 +729,8 @@ class WaveformApp:
         Baseline is the mean of pre-trigger samples (time_s < XZERO).
         Falls back to the first 10 % of samples if no pre-trigger region exists.
         """
+        if len(volts) == 0:
+            return 0.0, 0.0
         xzero = float(meta.get("XZERO", 0.0))
         pre_mask = time_s < xzero
         if pre_mask.sum() >= 5:
@@ -735,9 +738,11 @@ class WaveformApp:
         else:
             n_base = max(1, len(volts) // 10)
             baseline = volts[:n_base].mean()
+        if not np.isfinite(baseline):
+            baseline = 0.0
         bsub = volts - baseline
         integral  = float(np.trapezoid(bsub, time_s))
-        amplitude = float(bsub.max())
+        amplitude = float(bsub.max()) if len(bsub) > 0 else 0.0
         return integral, amplitude
 
     def _accumulate_hist(self, ch: str, integral: float, amplitude: float) -> None:
