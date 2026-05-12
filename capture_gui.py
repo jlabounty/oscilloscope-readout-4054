@@ -127,6 +127,7 @@ class WaveformApp:
         self._last_hist_draw = 0.0   # time.monotonic() of last histogram redraw
         self._hist_data: dict[str, dict[str, list]] = {}   # ch → {integral: [], amplitude: []}
         self._hist_axes: dict[str, dict[str, plt.Axes]] = {}  # ch → {integral: ax, amplitude: ax}
+        self._screenshot_count = 0
 
         # Tk variables
         self.prefix_var = tk.StringVar(value="waveforms")
@@ -291,6 +292,20 @@ class WaveformApp:
         )
         self.stop_btn.pack(fill=tk.X, pady=(4, 0))
 
+        self.screenshot_btn = tk.Button(
+            left,
+            text="Screenshot",
+            font=("", 10),
+            bg="#2a8c4a",
+            fg="white",
+            activebackground="#1f6e39",
+            activeforeground="white",
+            pady=5,
+            state=tk.DISABLED,
+            command=self._on_screenshot,
+        )
+        self.screenshot_btn.pack(fill=tk.X, pady=(4, 0))
+
         # Keep a list of all input widgets for bulk enable/disable
         self._input_widgets = [
             self.connect_btn,
@@ -391,6 +406,7 @@ class WaveformApp:
         self._set_conn_indicator("disconnected")
         self._set_status("Disconnected.")
         self.disconnect_btn.config(state=tk.DISABLED)
+        self.screenshot_btn.config(state=tk.DISABLED)
 
     # ── Browse ─────────────────────────────────────────────────────────────────
 
@@ -405,6 +421,7 @@ class WaveformApp:
     def _on_new_filename(self) -> None:
         self._ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         self._update_filename_preview()
+        self._screenshot_count = 0
 
     def _on_browse(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -464,6 +481,50 @@ class WaveformApp:
         self._stop_event.set()
         self.stop_btn.config(state=tk.DISABLED)
         self._set_status("Stopping after current channel…")
+
+    # ── Screenshot ─────────────────────────────────────────────────────────────
+
+    def _on_screenshot(self) -> None:
+        if self.scope is None:
+            self._set_status("Not connected.", "red")
+            return
+        self._screenshot_count += 1
+        path = self._screenshot_path(self._screenshot_count)
+        self.screenshot_btn.config(state=tk.DISABLED)
+        self._set_status("Taking screenshot…")
+        t = threading.Thread(
+            target=self._screenshot_worker, args=(self.scope, path), daemon=True
+        )
+        t.start()
+        self.root.after(POLL_MS, self._poll_result_queue)
+
+    def _screenshot_worker(self, scope, path: Path) -> None:
+        _PNG_END = b'IEND\xaeB`\x82'
+        try:
+            scope.write("HARDCOPY:FORMAT PNG")
+            scope.write("HARDCOPY:INKSAVER OFF")
+            old_timeout = scope.timeout
+            scope.timeout = 15_000
+            scope.write("HARDCOPY START")
+            # read_raw() returns at most chunk_size (~20 KB) per call; loop until
+            # we see the PNG IEND trailer or the scope stops sending data.
+            raw = b''
+            while _PNG_END not in raw[-12:]:
+                try:
+                    raw += scope.read_raw()
+                    scope.timeout = 3_000   # shorter timeout for subsequent chunks
+                except Exception:
+                    break
+            scope.timeout = old_timeout
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            self.result_queue.put(("screenshot_done", str(path)))
+        except Exception as e:
+            self.result_queue.put(("screenshot_error", str(e)))
+
+    def _screenshot_path(self, count: int) -> Path:
+        base = Path(self.file_var.get().strip())
+        return base.parent / f"{base.stem}_shot{count}.png"
 
     def _capture_worker(
         self,
@@ -566,6 +627,7 @@ class WaveformApp:
                     self._set_status(f"Connected: {idn}")
                     self.connect_btn.config(state=tk.NORMAL)
                     self.disconnect_btn.config(state=tk.NORMAL)
+                    self.screenshot_btn.config(state=tk.NORMAL)
                     done = True
 
                 elif kind == "connect_error":
@@ -604,6 +666,22 @@ class WaveformApp:
                     self._set_controls_enabled(True)
                     self.stop_btn.config(state=tk.DISABLED)
                     self.disconnect_btn.config(
+                        state=tk.NORMAL if self.scope is not None else tk.DISABLED
+                    )
+                    done = True
+
+                elif kind == "screenshot_done":
+                    _, path = msg
+                    self._set_status(f"Screenshot saved → {path}")
+                    self.screenshot_btn.config(
+                        state=tk.NORMAL if self.scope is not None else tk.DISABLED
+                    )
+                    done = True
+
+                elif kind == "screenshot_error":
+                    _, err = msg
+                    self._set_status(f"Screenshot error: {err}", "red")
+                    self.screenshot_btn.config(
                         state=tk.NORMAL if self.scope is not None else tk.DISABLED
                     )
                     done = True
