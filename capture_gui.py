@@ -29,7 +29,11 @@ except ImportError:
     import sys; sys.exit("Missing dependency: pip install pyvisa pyvisa-py")
 
 # Import core functions from the existing capture script
-from capture_waveforms import find_scope, connect, fetch_channel, save_hdf5, save_root, log_capture_tsv, get_scope_state
+from capture_waveforms import (
+    find_scope, connect, fetch_channel, fetch_channel_meta,
+    save_hdf5, save_root, log_capture_tsv, get_scope_state,
+    get_channel_measurements,
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -141,6 +145,9 @@ class WaveformApp:
         self.label_var = tk.StringVar(value="")
         self.notes_var = tk.StringVar(value="")
         self.root_var  = tk.BooleanVar(value=False)
+        self.acq_mode_var   = tk.StringVar(value="SAMPLE")
+        self.acq_numavg_var = tk.StringVar(value="16")
+        self.measure_var    = tk.BooleanVar(value=False)
 
         self.file_var.set(self._compute_filename())
         self.prefix_var.trace_add("write", lambda *_: self._update_filename_preview())
@@ -251,16 +258,39 @@ class WaveformApp:
         # -- CAPTURE OPTIONS --
         cap_frame = section("Capture Options")
         rows = [
-            ("Number of captures",      self.n_var),
+            ("Number of captures",        self.n_var),
             ("Wait between captures (s)", self.wait_var),
-            ("Capture label",            self.label_var),
-            ("Notes",                    self.notes_var),
+            ("Capture label",             self.label_var),
+            ("Notes",                     self.notes_var),
         ]
         for lbl, var in rows:
             row = tk.Frame(cap_frame)
             row.pack(fill=tk.X, pady=3)
             tk.Label(row, text=lbl, anchor="w").pack(fill=tk.X)
             tk.Entry(row, textvariable=var).pack(fill=tk.X)
+
+        # Acquisition mode
+        mode_row = tk.Frame(cap_frame)
+        mode_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(mode_row, text="Acquisition mode", anchor="w").pack(fill=tk.X)
+        ttk.Combobox(
+            mode_row,
+            textvariable=self.acq_mode_var,
+            values=["SAMPLE", "AVERAGE", "HIRES", "ENVELOPE", "PEAKDETECT"],
+            state="readonly",
+        ).pack(fill=tk.X)
+
+        # Averages — only visible when mode == AVERAGE
+        self._avg_frame = tk.Frame(cap_frame)
+        tk.Label(self._avg_frame, text="Averages", anchor="w").pack(fill=tk.X)
+        tk.Entry(self._avg_frame, textvariable=self.acq_numavg_var).pack(fill=tk.X)
+        self.acq_mode_var.trace_add("write", self._on_acq_mode_change)
+
+        tk.Checkbutton(
+            cap_frame,
+            text="Read scope measurements",
+            variable=self.measure_var,
+        ).pack(anchor="w", pady=(4, 0))
 
         sep()
 
@@ -432,6 +462,12 @@ class WaveformApp:
         if path:
             self.file_var.set(path)
 
+    def _on_acq_mode_change(self, *_) -> None:
+        if self.acq_mode_var.get() == "AVERAGE":
+            self._avg_frame.pack(fill=tk.X, pady=(2, 0))
+        else:
+            self._avg_frame.pack_forget()
+
     # ── Capture ────────────────────────────────────────────────────────────────
 
     def _on_capture(self) -> None:
@@ -448,17 +484,20 @@ class WaveformApp:
             self._set_status(msg, "red")
             return
 
-        channels   = [ch for ch, v in self.ch_vars.items() if v.get()]
-        pre_ns     = float(self.pre_var.get())
-        post_ns    = float(self.post_var.get())
-        pre_arg    = None if (pre_ns == 0 and post_ns == 0) else pre_ns
-        post_arg   = None if (pre_ns == 0 and post_ns == 0) else post_ns
-        n          = int(self.n_var.get())
-        wait_s     = parse_wait(self.wait_var)
-        filepath   = Path(self.file_var.get().strip())
-        label      = self.label_var.get().strip() or datetime.now().strftime("capture_%H%M%S")
-        notes      = self.notes_var.get().strip()
-        save_root_ = self.root_var.get()
+        channels    = [ch for ch, v in self.ch_vars.items() if v.get()]
+        pre_ns      = float(self.pre_var.get())
+        post_ns     = float(self.post_var.get())
+        pre_arg     = None if (pre_ns == 0 and post_ns == 0) else pre_ns
+        post_arg    = None if (pre_ns == 0 and post_ns == 0) else post_ns
+        n           = int(self.n_var.get())
+        wait_s      = parse_wait(self.wait_var)
+        filepath    = Path(self.file_var.get().strip())
+        label       = self.label_var.get().strip() or datetime.now().strftime("capture_%H%M%S")
+        notes       = self.notes_var.get().strip()
+        save_root_  = self.root_var.get()
+        acq_mode    = self.acq_mode_var.get()
+        acq_numavg  = self.acq_numavg_var.get()
+        do_measure  = self.measure_var.get()
 
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
@@ -471,7 +510,9 @@ class WaveformApp:
 
         t = threading.Thread(
             target=self._capture_worker,
-            args=(self.scope, channels, pre_arg, post_arg, n, wait_s, filepath, label, notes, save_root_),
+            args=(self.scope, channels, pre_arg, post_arg, n, wait_s,
+                  filepath, label, notes, save_root_,
+                  acq_mode, acq_numavg, do_measure),
             daemon=True,
         )
         t.start()
@@ -538,72 +579,124 @@ class WaveformApp:
         label: str,
         notes: str,
         save_root_: bool = False,
+        acq_mode: str = "SAMPLE",
+        acq_numavg: str = "16",
+        do_measure: bool = False,
     ) -> None:
         # pre/post are None (full record) or floats in nanoseconds.
         # Always fetch the full record; slice to the requested time window
         # afterwards using the time axis (which already has t=0 at the trigger).
 
-        try:
-            n_acq_before = -1   # sentinel; updated after each capture before RUN
-            for i in range(n):
+        channel_meta_cache: dict[str, dict] = {}
+
+        def _fetch_and_store(i: int, n_total: int) -> dict | None:
+            """Fetch all channels for one capture, return captured dict or None on cancel."""
+            capture_label = f"{label}_{i+1:03d}" if n_total > 1 else label
+            scope_state   = get_scope_state(scope, channels)
+            captured      = {}
+            for ch in channels:
                 if self._stop_event.is_set():
-                    self.result_queue.put(("status", "Capture cancelled."))
-                    break
-                # Wait until scope has a fresh trigger (and user's wait_s minimum has elapsed)
-                if i > 0:
-                    t_start = time.monotonic()
-                    while not self._stop_event.is_set():
-                        elapsed = time.monotonic() - t_start
-                        try:
-                            new_data = int(scope.query("ACQUIRE:NUMACQ?").strip()) > n_acq_before
-                        except Exception:
-                            new_data = True   # degrade gracefully if query fails
-                        if new_data and elapsed >= wait_s:
-                            break
-                        if new_data:
-                            self.result_queue.put((
-                                "status",
-                                f"Capture {i+1}/{n} — new trigger ready, "
-                                f"waiting {wait_s - elapsed:.1f}s more…",
-                            ))
-                        else:
-                            self.result_queue.put((
-                                "status",
-                                f"Capture {i+1}/{n} — waiting for new trigger… ({elapsed:.1f}s)",
-                            ))
-                        time.sleep(0.05)
+                    return None
+                self.result_queue.put(
+                    ("status", f"Capture {i+1}/{n_total} — reading {ch}…")
+                )
+                time_s, volts, meta = fetch_channel(
+                    scope, ch, None, None,
+                    cached_meta=channel_meta_cache.get(ch),
+                )
+                if do_measure:
+                    meta.update(get_channel_measurements(scope, ch))
+                if pre is not None:
+                    mask   = (time_s >= -pre * 1e-9) & (time_s <= post * 1e-9)
+                    time_s = time_s[mask]
+                    volts  = volts[mask]
+                captured[ch] = (time_s, volts, meta)
+                self.result_queue.put(("channel_done", i, ch, time_s, volts, meta))
+            save_hdf5(filepath, captured, label=capture_label, notes=notes, scope_state=scope_state)
+            if save_root_:
+                save_root(filepath, captured, label=capture_label, scope_state=scope_state)
+            log_capture_tsv(filepath, capture_label, channels, pre, post, notes, scope_state=scope_state)
+            self.result_queue.put(("capture_done", i + 1, n_total, str(filepath)))
+            return captured
+
+        try:
+            # Apply acquisition mode (and averages count) once before the loop
+            scope.write(f"ACQUIRE:MODE {acq_mode}")
+            if acq_mode.upper() == "AVERAGE":
+                scope.write(f"ACQUIRE:NUMAVG {acq_numavg}")
+
+            # Each iteration arms the scope for one complete acquisition and
+            # waits for it to auto-stop in SEQUENCE mode. In SAMPLE/HIRES/
+            # ENVELOPE/PEAKDETECT this is a single fresh trigger; in AVERAGE
+            # it's NUMAVG triggers. The DPO4054 has no FastFrame/segmented
+            # memory, so this is the fastest fresh-trigger-per-readout loop
+            # the hardware supports.
+            try:
+                prev_stopafter = scope.query("ACQUIRE:STOPAFTER?").strip()
+            except Exception:
+                prev_stopafter = "RUNSTOP"
+            scope.write("ACQUIRE:STOPAFTER SEQUENCE")
+
+            # Cache per-channel preamble + display settings once per session.
+            # Skips ~15 SCPI round-trips per channel per capture; valid until
+            # the user changes scope vertical/horizontal/trigger config.
+            self.result_queue.put(("status", "Caching channel metadata…"))
+            for ch in channels:
+                try:
+                    channel_meta_cache[ch] = fetch_channel_meta(scope, ch)
+                except Exception:
+                    channel_meta_cache[ch] = {}
+
+            try:
+                for i in range(n):
                     if self._stop_event.is_set():
                         self.result_queue.put(("status", "Capture cancelled."))
                         break
-                capture_label = f"{label}_{i+1:03d}" if n > 1 else label
-                scope.write("ACQUIRE:STATE STOP")   # freeze memory — all channels from same trigger
-                scope_state = get_scope_state(scope, channels)
-                captured = {}
-                for ch in channels:
-                    if self._stop_event.is_set():
-                        break
-                    self.result_queue.put(
-                        ("status", f"Capture {i+1}/{n} — fetching {ch}…")
-                    )
-                    time_s, volts, meta = fetch_channel(scope, ch, None, None)
-                    if pre is not None:
-                        mask   = (time_s >= -pre * 1e-9) & (time_s <= post * 1e-9)
-                        time_s = time_s[mask]
-                        volts  = volts[mask]
-                    captured[ch] = (time_s, volts, meta)
-                    self.result_queue.put(("channel_done", i, ch, time_s, volts, meta))
 
-                if captured:
-                    save_hdf5(filepath, captured, label=capture_label, notes=notes, scope_state=scope_state)
-                    if save_root_:
-                        save_root(filepath, captured, label=capture_label, scope_state=scope_state)
-                    log_capture_tsv(filepath, capture_label, channels, pre, post, notes, scope_state=scope_state)
-                    self.result_queue.put(("capture_done", i + 1, n, str(filepath)))
-                try:
-                    n_acq_before = int(scope.query("ACQUIRE:NUMACQ?").strip())
-                except Exception:
-                    n_acq_before = -1   # skip poll on next iteration
-                scope.write("ACQUIRE:STATE RUN")     # re-arm for next capture
+                    # Optional inter-capture spacing
+                    if i > 0 and wait_s > 0:
+                        t_start = time.monotonic()
+                        while not self._stop_event.is_set():
+                            remaining = wait_s - (time.monotonic() - t_start)
+                            if remaining <= 0:
+                                break
+                            self.result_queue.put((
+                                "status",
+                                f"Capture {i+1}/{n} — pausing {remaining:.1f}s…",
+                            ))
+                            time.sleep(min(0.05, remaining))
+                        if self._stop_event.is_set():
+                            self.result_queue.put(("status", "Capture cancelled."))
+                            break
+
+                    # Arm scope; it auto-stops after one full acquisition.
+                    scope.write("ACQUIRE:STATE RUN")
+                    t_start = time.monotonic()
+                    while not self._stop_event.is_set():
+                        try:
+                            state = int(scope.query("ACQUIRE:STATE?").strip())
+                        except Exception:
+                            state = 0
+                        if state == 0:
+                            break
+                        self.result_queue.put((
+                            "status",
+                            f"Capture {i+1}/{n} — waiting for trigger… "
+                            f"({time.monotonic() - t_start:.1f}s)",
+                        ))
+                        time.sleep(0.05)
+
+                    if self._stop_event.is_set():
+                        scope.write("ACQUIRE:STATE STOP")
+                        self.result_queue.put(("status", "Capture cancelled."))
+                        break
+
+                    if _fetch_and_store(i, n) is None:
+                        break
+            finally:
+                scope.write("ACQUIRE:STATE STOP")
+                scope.write(f"ACQUIRE:STOPAFTER {prev_stopafter}")
+                scope.write("ACQUIRE:STATE RUN")
 
         except Exception as e:
             self.result_queue.put(("error", str(e)))

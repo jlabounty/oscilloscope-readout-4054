@@ -101,35 +101,23 @@ def get_preamble(scope: pyvisa.Resource) -> dict:
     return preamble
 
 
-def fetch_channel(
-    scope: pyvisa.Resource,
-    channel: str,
-    pre_samples: int | None = 1000,
-    post_samples: int | None = 1000,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Capture a single channel waveform.
+def fetch_channel_meta(scope: pyvisa.Resource, channel: str) -> dict:
+    """Query preamble + per-channel display settings for one channel.
 
-    Parameters
-    ----------
-    pre_samples  : samples to keep before the trigger (None = full record)
-    post_samples : samples to keep after the trigger  (None = full record)
+    Also configures DATA:SOURCE, DATA:ENCDG RIBINARY, and DATA:WIDTH 1
+    (8-bit transfer, matching the DPO4054's native ADC resolution — using
+    16-bit would just zero-pad each sample and double the CURVE? transfer
+    time for no information gain).
 
-    Returns
-    -------
-    time_s   : 1-D array of time values in seconds
-    volts    : 1-D array of voltage values in volts
-    meta     : dict of preamble + per-channel display settings
+    The returned dict can be cached and passed to fetch_channel via
+    cached_meta=... to skip the ~15 SCPI round-trips this function makes,
+    valid for as long as the scope's vertical/horizontal/trigger config
+    doesn't change.
     """
     scope.write(f"DATA:SOURCE {channel}")
-    scope.write("DATA:ENCDG RIBINARY")   # signed binary — faster than ASCII
-    scope.write("DATA:WIDTH 2")          # 2 bytes per sample → full 16-bit res
-
-    # Fetch preamble first so we know the trigger position (PT_OFF) and
-    # record length (NR_PT) before setting the transfer window.
+    scope.write("DATA:ENCDG RIBINARY")
+    scope.write("DATA:WIDTH 1")
     meta = get_preamble(scope)
-
-    # Per-channel display settings (not in WFMPRE)
     for key, cmd in [
         ("CH_COUPLING",  f"{channel}:COUPling?"),
         ("CH_SCALE",     f"{channel}:SCAle?"),
@@ -140,6 +128,37 @@ def fetch_channel(
             meta[key] = scope.query(cmd).strip()
         except Exception:
             pass
+    return meta
+
+
+def fetch_channel(
+    scope: pyvisa.Resource,
+    channel: str,
+    pre_samples: int | None = 1000,
+    post_samples: int | None = 1000,
+    cached_meta: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Capture a single channel waveform.
+
+    Parameters
+    ----------
+    pre_samples  : samples to keep before the trigger (None = full record)
+    post_samples : samples to keep after the trigger  (None = full record)
+    cached_meta  : preamble + channel settings from a prior call to
+                   fetch_channel_meta; when supplied, skips the per-channel
+                   metadata queries (large speedup for multi-capture sessions)
+    Returns
+    -------
+    time_s   : 1-D array of time values in seconds
+    volts    : 1-D array of voltage values in volts
+    meta     : dict of preamble + per-channel display settings
+    """
+    if cached_meta is None:
+        meta = fetch_channel_meta(scope, channel)
+    else:
+        meta = dict(cached_meta)            # copy so callers can mutate freely
+        scope.write(f"DATA:SOURCE {channel}")
 
     pt_off = int(float(meta.get("PT_OFF", 0)))
     nr_pt  = int(meta.get("NR_PT", 0)) or None   # 0 → unknown
@@ -160,9 +179,9 @@ def fetch_channel(
         scope.write(f"DATA:STOP {stop_1idx}")
         start_0idx = start_1idx - 1   # convert to 0-based full-record index
 
-    # Read raw binary curve
+    # Read raw binary curve (signed 8-bit; matches DATA:WIDTH 1 set above)
     raw_bytes = scope.query_binary_values(
-        "CURVE?", datatype="h", is_big_endian=True, container=np.ndarray
+        "CURVE?", datatype="b", container=np.ndarray
     )
 
     # Scale to physical units
@@ -193,6 +212,7 @@ SCOPE_STATE_QUERIES: dict[str, str] = {
     "trig_freq_hz":   "TRIGger:FREQuency?",
     "acq_mode":       "ACQuire:MODe?",
     "acq_numavg":     "ACQuire:NUMAVg?",
+    "setup":          "SET?",           # full instrument configuration blob
 }
 
 
@@ -213,6 +233,33 @@ def get_scope_state(scope: pyvisa.Resource, channels: list[str]) -> dict:
         except Exception:
             pass
     return state
+
+
+# ── Instant measurements ──────────────────────────────────────────────────────
+
+_INSTANT_MEAS = [
+    "AMPLITUDE", "HIGH", "LOW", "MEAN", "RMS",
+    "FREQUENCY", "PERIOD", "RISETIME", "FALLTIME",
+]
+
+def get_channel_measurements(scope: pyvisa.Resource, channel: str) -> dict:
+    """Query scope-computed immediate measurements for one channel.
+
+    Returns a dict of {meas_<type>: float} for any measurement the scope
+    considers valid.  Tektronix uses 9.9E+37 as the "not available" sentinel
+    (e.g. frequency on a non-periodic signal); those entries are omitted.
+    """
+    results: dict[str, float] = {}
+    scope.write(f"MEASUREMENT:IMMEd:SOURCE1 {channel}")
+    for mtype in _INSTANT_MEAS:
+        scope.write(f"MEASUREMENT:IMMEd:TYPE {mtype}")
+        try:
+            v = float(scope.query("MEASUREMENT:IMMEd:VALUE?").strip())
+            if v < 9e37:
+                results[f"meas_{mtype.lower()}"] = v
+        except Exception:
+            pass
+    return results
 
 
 # ── HDF5 saving ───────────────────────────────────────────────────────────────
@@ -254,11 +301,22 @@ def save_hdf5(
 
         # Capture-level scope state (horizontal, trigger, acquire settings)
         if scope_state:
-            for k, v in scope_state.items():
+            state_copy = dict(scope_state)
+            setup_blob = state_copy.pop("setup", None)
+            for k, v in state_copy.items():
                 try:
                     cap_grp.attrs[k] = v
                 except Exception:
                     pass
+            if setup_blob:
+                # SET? blob is 10–40 KB — too large for an HDF5 attribute; store as
+                # a 1-D byte array so it supports gzip (scalars don't).
+                blob_bytes = setup_blob.encode() if isinstance(setup_blob, str) else setup_blob
+                cap_grp.create_dataset(
+                    "instrument_setup",
+                    data=np.frombuffer(blob_bytes, dtype="uint8"),
+                    compression="gzip",
+                )
 
         for ch_name, (time_s, volts, meta) in channels.items():
             ch_grp = cap_grp.create_group(ch_name)
@@ -562,6 +620,15 @@ def main():
             label      = prompt_label()
             notes      = prompt_notes()
 
+            # Cache per-channel meta once per batch — skips ~15 SCPI queries
+            # per channel per capture.
+            channel_meta_cache: dict[str, dict] = {}
+            for ch in channels:
+                try:
+                    channel_meta_cache[ch] = fetch_channel_meta(scope, ch)
+                except Exception:
+                    channel_meta_cache[ch] = {}
+
             for i in range(1, n_captures + 1):
                 if n_captures > 1:
                     capture_label = f"{label}_{i:03d}"
@@ -576,7 +643,10 @@ def main():
                 for ch in channels:
                     print(f"  {ch} … ", end="", flush=True)
                     try:
-                        time_s, volts, meta = fetch_channel(scope, ch, pre, post)
+                        time_s, volts, meta = fetch_channel(
+                            scope, ch, pre, post,
+                            cached_meta=channel_meta_cache.get(ch),
+                        )
                         captured[ch] = (time_s, volts, meta)
                         n_pts = len(volts)
                         print(f"{n_pts:,} pts  |  {_fmt_duration(time_s[-1] - time_s[0])} window")

@@ -36,10 +36,15 @@ Opens an interactive window with:
 - **Connect to Scope / Disconnect** — scans USB and connects; coloured indicator shows connection state (red/yellow/green); Disconnect closes the VISA session cleanly
 - **Output File** — path for the `.h5` output file, with Browse and New Filename buttons (New Filename stamps the current time)
 - **Channels** — checkboxes for CH1–CH4
-- **Trigger Window** — pre/post-trigger sample counts (`0 0` = full record)
-- **Capture Options** — number of captures, wait time between captures (seconds, default 0), capture label, notes
-- **Capture** — starts acquisition; waveforms are plotted live as each channel is digitized; a red dashed trigger line is overlaid at t = 0 (XZERO); multiple captures are overlaid using the viridis colormap; a minimum of 0.1 s is enforced between successive captures regardless of the wait setting
-- **Histograms** — displayed alongside the waveforms; per-channel histograms of the baseline-subtracted pulse integral (V·s) and peak amplitude (V) accumulate across captures within a session; baseline is estimated from pre-trigger samples; a **Clear Histograms** button resets without interrupting capture
+- **Trigger Window** — pre/post-trigger time in nanoseconds (`0 0` = full record)
+- **Capture Options**
+  - Number of captures, wait time between captures (seconds), capture label, notes
+  - **Acquisition mode** — `SAMPLE` (default), `AVERAGE`, `HIRES`, `ENVELOPE`, or `PEAKDETECT`; selecting `AVERAGE` reveals an averages count field
+  - **Read scope measurements** — opt-in; after each capture, queries AMPLITUDE, HIGH, LOW, MEAN, RMS, FREQUENCY, PERIOD, RISETIME, FALLTIME from the scope and stores them as channel attributes in the HDF5 file; adds ~1–2 s overhead per capture for 4 channels
+- **Capture** — starts acquisition; waveforms are plotted live as each channel is digitized; a red dashed trigger line is overlaid at t = 0; multiple captures are overlaid using a sequential colormap
+- **Stop** — cancels a running capture after the current channel
+- **Histograms** — per-channel histograms of the baseline-subtracted pulse integral (V·s) and peak amplitude (V) accumulate across captures; a **Clear Histograms** button resets without interrupting capture
+- **Screenshot** — saves a PNG of the scope display to `./data/{prefix}_{timestamp}_shot{N}.png` alongside the waveform file; counter resets when New Filename is clicked
 
 ### CLI
 
@@ -66,11 +71,18 @@ Multiple captures in one session are appended as separate groups in the same fil
 
 ```
 /  (attrs: created, last_updated)
-/<capture_label>/  (attrs: timestamp, notes)
+/<capture_label>/
+    attrs:   timestamp, notes
+             sample_rate_hz, h_scale_s_div
+             trig_type, trig_source, trig_level_v, trig_slope, trig_freq_hz
+             acq_mode, acq_numavg
+    instrument_setup   dataset  full SET? blob (gzip-compressed), ~10–40 KB
     /CH1/
         time_s   [N]  float64  seconds
         volts    [N]  float64  volts
-        attrs:   all WFMPRE preamble fields (XINCR, YMULT, YOFF, …)
+        attrs:   all WFMPRE preamble fields (XINCR, YMULT, YOFF, YZERO, XZERO, …)
+                 CH_COUPLING, CH_SCALE, CH_BANDWIDTH, CH_PROBE
+                 meas_amplitude, meas_mean, meas_rms, …  (if measurements enabled)
     /CH2/  ...
 ```
 
@@ -82,8 +94,10 @@ import h5py, numpy as np
 with h5py.File("waveforms_20260318_142301.h5", "r") as f:
     t = f["run3_signal/CH1/time_s"][:]
     v = f["run3_signal/CH1/volts"][:]
-    yunit = f["run3_signal/CH1/volts"].attrs["units"]   # 'V'
-    xunit = f["run3_signal/CH1/time_s"].attrs["units"]  # 's'
+    yunit = f["run3_signal/CH1/volts"].attrs["units"]      # 'V'
+    xunit = f["run3_signal/CH1/time_s"].attrs["units"]     # 's'
+    amp   = f["run3_signal/CH1"].attrs.get("meas_amplitude")
+    setup = f["run3_signal/instrument_setup"][:].tobytes().decode()  # full scope config
 ```
 
 ### TSV capture log
@@ -101,11 +115,26 @@ Columns:
 | `pre_samples` | Pre-trigger samples, or `full` |
 | `post_samples` | Post-trigger samples, or `full` |
 | `notes` | Free-text notes |
+| `sample_rate_hz` | Sample rate at time of capture |
+| `h_scale_s_div` | Horizontal scale (s/div) |
+| `trig_type` | Trigger type (e.g. `EDGE`) |
+| `trig_source` | Trigger source channel |
+| `trig_level_v` | Trigger level in volts |
+| `trig_slope` | Trigger slope (`RISE` / `FALL`) |
+| `trig_freq_hz` | Measured trigger frequency |
+| `acq_mode` | Acquisition mode at capture time |
+| `acq_numavg` | Number of averages (AVERAGE mode only) |
+
+### Screenshots
+
+The **Screenshot** button saves the scope display as a PNG via the `HARDCOPY` SCPI command over USBTMC. Files are named `{prefix}_{timestamp}_shot{N}.png` in the same `./data/` directory as the waveform file. The counter resets when the output filename is refreshed.
 
 ## Notes
 
-- Transfer uses signed 16-bit binary encoding (`RIBINARY`) for speed — much faster than ASCII at long record lengths
+- Transfer uses signed 8-bit binary (`RIBINARY` + `DATA:WIDTH 1`) — the DPO4054 has an 8-bit ADC, so 16-bit transfer would just zero-pad each sample and double the `CURVE?` time for no information gain
 - All HDF5 datasets are gzip-compressed
 - Physical-unit scaling is applied from the WFMPRE preamble: `volts = (raw - YOFF) * YMULT + YZERO`; preamble fields are queried individually (`WFMPRE:YMULT?`, `WFMPRE:YOFF?`, …) because the DPO4054 returns only the WFID string for the bulk `WFMPRE?` query
-- Memory is frozen with `ACQUIRE:STATE STOP` before reading all channels, ensuring every channel comes from the same trigger event; acquisition is re-armed with `ACQUIRE:STATE RUN` afterwards
+- Per-channel preamble + display settings are queried once per capture batch and cached; subsequent captures in the batch skip the ~15 SCPI round-trips per channel. The cache is invalidated when the user starts a new Capture run, so changes to scope vertical/horizontal/trigger settings between batches are picked up automatically
+- Each capture is a single-sequence acquisition (`ACQUIRE:STOPAFTER SEQUENCE`): the scope is armed with `ACQUIRE:STATE RUN`, completes one full trigger (or NUMAVG triggers in AVERAGE mode), and auto-stops — guaranteeing every readout comes from a fresh trigger and all channels share the same event
+- The DPO4054 does not support FastFrame / segmented memory acquisition; every capture incurs the CURVE? transfer time as dead time between triggers
 - Programmer reference: Tektronix MSO4000/DPO4000 Series Programmer Manual (077-0248-01)
