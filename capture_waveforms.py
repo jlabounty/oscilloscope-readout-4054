@@ -13,6 +13,7 @@ On Linux, you may also need:
     # and add udev rule for Tektronix USB access (see README at bottom)
 """
 
+import argparse
 import sys
 import time
 from datetime import datetime
@@ -29,6 +30,11 @@ try:
     import h5py
 except ImportError:
     sys.exit("Missing dependency: pip install h5py")
+
+try:
+    import yaml
+except ImportError:
+    yaml = None   # only required when --config / --example-config is used
 
 
 # ── VISA / scope connection ────────────────────────────────────────────────────
@@ -479,9 +485,343 @@ def log_capture_tsv(
     print(f"  Log    → {tsv_path}")
 
 
-# ── CLI helpers ────────────────────────────────────────────────────────────────
+# ── Config-driven capture (YAML) ──────────────────────────────────────────────
 
 VALID_CHANNELS = {"CH1", "CH2", "CH3", "CH4"}
+
+DEFAULT_CONFIG: dict = {
+    "output": {
+        "prefix":    "waveforms",
+        "filename":  None,          # explicit path overrides prefix+timestamp
+        "data_dir":  "./data",
+        "save_root": False,
+        "save_screenshot_begin": True,
+        "save_screenshot_end":   True,
+    },
+    "channels": ["CH1"],
+    "trigger_window": {              # nanoseconds (matches the GUI)
+        "pre_ns":  1000.0,
+        "post_ns": 1000.0,
+    },
+    "capture": {
+        "n_captures": 1,
+        "wait_s":     0.0,
+        "label":      "",
+        "notes":      "",
+    },
+    "acquisition": {
+        "mode":   "SAMPLE",          # SAMPLE | AVERAGE | HIRES | ENVELOPE | PEAKDETECT
+        "numavg": 16,                # used only when mode == AVERAGE
+    },
+    "measurements": {
+        "enabled": False,
+    },
+}
+
+EXAMPLE_CONFIG_YAML = """\
+# Tektronix DPO4054 Waveform Capture — Example Configuration
+# -----------------------------------------------------------
+#   python capture_waveforms.py --config this_file.yaml
+#
+# All fields mirror the controls in capture_gui.py.  Any field may be
+# omitted; omitted fields fall back to the defaults baked into
+# DEFAULT_CONFIG in capture_waveforms.py.
+
+output:
+  # Final filename is {data_dir}/{prefix}_{YYYYMMDD_HHMMSS}.h5
+  # unless `filename` is set explicitly (which overrides prefix+timestamp).
+  prefix:    waveforms
+  filename:  null
+  data_dir:  ./data
+  save_root: false           # also write a .root file via uproot
+  save_screenshot_begin: true  # save scope PNG before first capture ({prefix}_{ts}_begin.png)
+  save_screenshot_end:   true  # save scope PNG after last capture  ({prefix}_{ts}_end.png)
+
+# Channels to capture — any subset of CH1, CH2, CH3, CH4.
+channels:
+  - CH1
+
+# Time window around the trigger, in nanoseconds.
+# Set both to 0 to capture the full record length.
+trigger_window:
+  pre_ns:  1000.0
+  post_ns: 1000.0
+
+capture:
+  n_captures: 1              # number of triggered acquisitions
+  wait_s:     0.0            # pause between successive captures (seconds)
+  label:      ""             # HDF5 group label; "" → capture_HHMMSS
+  notes:      ""             # free-text notes saved with each capture
+
+acquisition:
+  # SAMPLE | AVERAGE | HIRES | ENVELOPE | PEAKDETECT
+  mode:   SAMPLE
+  numavg: 16                 # only used when mode == AVERAGE
+
+measurements:
+  # Query scope-side measurements (AMPLITUDE, MEAN, RMS, FREQUENCY, …) and
+  # store them as channel HDF5 attributes. Adds ~1–2 s per capture.
+  enabled: false
+"""
+
+
+def _merge_config(default: dict, user: dict) -> dict:
+    """Deep-merge *user* into *default* (user wins). Returns a new dict."""
+    out = dict(default)
+    for k, v in (user or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge_config(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path: str | Path) -> dict:
+    """Load a YAML config file and merge it with DEFAULT_CONFIG."""
+    if yaml is None:
+        raise ImportError("YAML config requires PyYAML: pip install pyyaml")
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path) as f:
+        user_cfg = yaml.safe_load(f) or {}
+    if not isinstance(user_cfg, dict):
+        raise ValueError(f"Top level of {path} must be a YAML mapping, got {type(user_cfg).__name__}")
+    return _merge_config(DEFAULT_CONFIG, user_cfg)
+
+
+def write_example_config(path: str | Path) -> Path:
+    """Write the example YAML to *path* (creating parent dirs)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(EXAMPLE_CONFIG_YAML)
+    return path
+
+
+def resolve_output_path(cfg: dict) -> Path:
+    """Compute the HDF5 output file path from cfg['output']."""
+    out = cfg["output"]
+    if out.get("filename"):
+        path = Path(out["filename"])
+    else:
+        prefix = out.get("prefix") or "waveforms"
+        data_dir = Path(out.get("data_dir") or "./data")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = data_dir / f"{prefix}_{ts}.h5"
+    if path.suffix.lower() not in {".h5", ".hdf5"}:
+        path = path.with_suffix(".h5")
+    return path
+
+
+def save_screenshot(scope: "pyvisa.Resource", path: Path) -> None:
+    """Save a PNG screenshot from the scope's display to *path*.
+
+    Uses HARDCOPY START with FORMAT PNG.  Loops on read_raw() until the PNG
+    IEND trailer is seen (the DPO4054 sends the image in ~20 KB chunks).
+    """
+    _PNG_END = b'IEND\xaeB`\x82'
+    scope.write("HARDCOPY:FORMAT PNG")
+    scope.write("HARDCOPY:INKSAVER OFF")
+    old_timeout = scope.timeout
+    scope.timeout = 15_000
+    scope.write("HARDCOPY START")
+    raw = b''
+    try:
+        while _PNG_END not in raw[-12:]:
+            try:
+                raw += scope.read_raw()
+                scope.timeout = 3_000
+            except Exception:
+                break
+    finally:
+        scope.timeout = old_timeout
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    print(f"  Screenshot → {path}")
+
+
+def _wait_for_acquisition(scope: "pyvisa.Resource", label: str) -> None:
+    """Poll ACQUIRE:STATE? until the scope auto-stops after one sequence."""
+    t_start = time.monotonic()
+    next_msg = t_start + 1.0
+    while True:
+        try:
+            state = int(scope.query("ACQUIRE:STATE?").strip())
+        except Exception:
+            state = 0
+        if state == 0:
+            return
+        now = time.monotonic()
+        if now >= next_msg:
+            print(f"  {label} — waiting for trigger… ({now - t_start:.1f}s)",
+                  end="\r", flush=True)
+            next_msg = now + 1.0
+        time.sleep(0.05)
+
+
+def run_capture(config: dict, scope: "pyvisa.Resource | None" = None) -> Path:
+    """Run a non-interactive capture session driven by a config dict.
+
+    Mirrors the GUI's capture flow (capture_gui.py:_capture_worker):
+
+      1. Apply ACQUIRE:MODE (+ NUMAVG if AVERAGE)
+      2. Switch to ACQUIRE:STOPAFTER SEQUENCE so each iteration is a single
+         fresh trigger
+      3. Cache per-channel preamble + display settings once
+      4. For each of n_captures:
+           - arm acquisition, wait for it to complete
+           - read every selected channel (full record), optionally query
+             scope measurements, then slice to ±pre_ns / +post_ns window
+           - save to HDF5 (and ROOT, if enabled) and append a TSV log row
+
+    Parameters
+    ----------
+    config : dict
+        Same structure as DEFAULT_CONFIG / the example YAML.  Missing keys
+        fall back to defaults.
+    scope : pyvisa.Resource, optional
+        Open VISA resource.  When None, the function connects to the first
+        Tektronix USB scope it finds and closes the session on exit.
+
+    Returns
+    -------
+    Path
+        The HDF5 file written (existing on disk).
+    """
+    cfg = _merge_config(DEFAULT_CONFIG, config or {})
+
+    channels   = [c.upper() for c in cfg["channels"]]
+    pre_ns     = float(cfg["trigger_window"]["pre_ns"])
+    post_ns    = float(cfg["trigger_window"]["post_ns"])
+    n_caps     = int(cfg["capture"]["n_captures"])
+    wait_s     = float(cfg["capture"]["wait_s"])
+    label      = cfg["capture"]["label"] or datetime.now().strftime("capture_%H%M%S")
+    notes      = cfg["capture"]["notes"] or ""
+    save_root_        = bool(cfg["output"]["save_root"])
+    screenshot_begin  = bool(cfg["output"]["save_screenshot_begin"])
+    screenshot_end    = bool(cfg["output"]["save_screenshot_end"])
+    acq_mode   = str(cfg["acquisition"]["mode"]).upper()
+    acq_numavg = int(cfg["acquisition"]["numavg"])
+    do_measure = bool(cfg["measurements"]["enabled"])
+
+    bad = [c for c in channels if c not in VALID_CHANNELS]
+    if bad:
+        raise ValueError(f"Unrecognised channel(s): {bad}. Must be one of {sorted(VALID_CHANNELS)}.")
+    if not channels:
+        raise ValueError("config['channels'] must list at least one channel.")
+    if n_caps < 1:
+        raise ValueError(f"n_captures must be >= 1, got {n_caps}.")
+
+    full_record = (pre_ns == 0 and post_ns == 0)
+    filepath = resolve_output_path(cfg)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Output  → {filepath}")
+    print(f"Channels: {', '.join(channels)}  |  mode: {acq_mode}"
+          f"{' (numavg=' + str(acq_numavg) + ')' if acq_mode == 'AVERAGE' else ''}"
+          f"  |  window: {'full record' if full_record else f'-{pre_ns:g} / +{post_ns:g} ns'}"
+          f"  |  n_captures: {n_caps}")
+
+    own_scope = scope is None
+    if own_scope:
+        rm = pyvisa.ResourceManager()
+        resource_str = find_scope(rm)
+        scope = connect(resource_str)
+
+    try:
+        if screenshot_begin:
+            try:
+                save_screenshot(scope, filepath.with_name(f"{filepath.stem}_begin.png"))
+            except Exception as e:
+                print(f"  Screenshot (begin) failed: {e}")
+
+        scope.write(f"ACQUIRE:MODE {acq_mode}")
+        if acq_mode == "AVERAGE":
+            scope.write(f"ACQUIRE:NUMAVG {acq_numavg}")
+
+        try:
+            prev_stopafter = scope.query("ACQUIRE:STOPAFTER?").strip()
+        except Exception:
+            prev_stopafter = "RUNSTOP"
+        scope.write("ACQUIRE:STOPAFTER SEQUENCE")
+
+        channel_meta_cache: dict[str, dict] = {}
+        for ch in channels:
+            try:
+                channel_meta_cache[ch] = fetch_channel_meta(scope, ch)
+            except Exception:
+                channel_meta_cache[ch] = {}
+
+        try:
+            for i in range(n_caps):
+                if i > 0 and wait_s > 0:
+                    time.sleep(wait_s)
+
+                scope.write("ACQUIRE:STATE RUN")
+                capture_label = f"{label}_{i+1:03d}" if n_caps > 1 else label
+                _wait_for_acquisition(scope, f"Capture {i+1}/{n_caps}")
+                print(f"\nCapture {i+1}/{n_caps}: {capture_label}  ({', '.join(channels)})")
+
+                scope_state = get_scope_state(scope, channels)
+                captured: dict[str, tuple[np.ndarray, np.ndarray, dict]] = {}
+                for ch in channels:
+                    print(f"  {ch} … ", end="", flush=True)
+                    try:
+                        time_s, volts, meta = fetch_channel(
+                            scope, ch, None, None,
+                            cached_meta=channel_meta_cache.get(ch),
+                        )
+                        if do_measure:
+                            meta.update(get_channel_measurements(scope, ch))
+                        if not full_record:
+                            mask   = (time_s >= -pre_ns * 1e-9) & (time_s <= post_ns * 1e-9)
+                            time_s = time_s[mask]
+                            volts  = volts[mask]
+                        captured[ch] = (time_s, volts, meta)
+                        span = (time_s[-1] - time_s[0]) if len(time_s) > 1 else 0.0
+                        print(f"{len(volts):,} pts  |  {_fmt_duration(span)} window")
+                    except Exception as e:
+                        print(f"FAILED ({e})")
+
+                if captured:
+                    save_hdf5(filepath, captured, label=capture_label,
+                              notes=notes, scope_state=scope_state)
+                    if save_root_:
+                        save_root(filepath, captured, label=capture_label,
+                                  scope_state=scope_state)
+                    pre_log  = None if full_record else pre_ns
+                    post_log = None if full_record else post_ns
+                    log_capture_tsv(filepath, capture_label, channels,
+                                    pre_log, post_log, notes,
+                                    scope_state=scope_state)
+                else:
+                    print("  No data captured — nothing saved.")
+        finally:
+            scope.write("ACQUIRE:STATE STOP")
+            scope.write(f"ACQUIRE:STOPAFTER {prev_stopafter}")
+            scope.write("ACQUIRE:STATE RUN")
+            if screenshot_end:
+                try:
+                    save_screenshot(scope, filepath.with_name(f"{filepath.stem}_end.png"))
+                except Exception as e:
+                    print(f"  Screenshot (end) failed: {e}")
+    finally:
+        if own_scope:
+            try:
+                scope.close()
+            except Exception:
+                pass
+
+    return filepath
+
+
+def run_capture_from_yaml(path: str | Path,
+                          scope: "pyvisa.Resource | None" = None) -> Path:
+    """Convenience wrapper: load a YAML file and call run_capture()."""
+    return run_capture(load_config(path), scope=scope)
+
+
+# ── CLI helpers ────────────────────────────────────────────────────────────────
 
 def prompt_channels() -> list[str]:
     """Ask the user which channels to capture."""
@@ -592,7 +932,8 @@ def prompt_window(
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def main():
+def interactive_main():
+    """Interactive prompt-driven capture session (no YAML config)."""
     print("=" * 60)
     print("  Tektronix DPO4054 — Waveform Capture Utility")
     print("=" * 60)
@@ -670,6 +1011,43 @@ def main():
         print("Scope connection closed. Goodbye.")
 
 
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry point.
+
+    Usage
+    -----
+        python capture_waveforms.py                          # interactive prompts
+        python capture_waveforms.py --config run.yaml        # headless, YAML-driven
+        python capture_waveforms.py --example-config foo.yaml  # write template & exit
+    """
+    parser = argparse.ArgumentParser(
+        prog="capture_waveforms.py",
+        description="Capture waveforms from a Tektronix DPO4054 oscilloscope.",
+    )
+    parser.add_argument(
+        "-c", "--config", metavar="PATH",
+        help="YAML config file describing the capture session (headless mode).",
+    )
+    parser.add_argument(
+        "--example-config", metavar="PATH",
+        help="Write a default YAML config to PATH and exit.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.example_config:
+        out = write_example_config(args.example_config)
+        print(f"Wrote example config → {out}")
+        return
+
+    if args.config:
+        cfg = load_config(args.config)
+        path = run_capture(cfg)
+        print(f"\nDone. Output: {path}")
+        return
+
+    interactive_main()
+
+
 if __name__ == "__main__":
     main()
 
@@ -680,7 +1058,7 @@ if __name__ == "__main__":
 #
 # Installation
 # ------------
-#   pip install pyvisa pyvisa-py numpy h5py pyusb
+#   pip install pyvisa pyvisa-py numpy h5py pyusb pyyaml
 #
 # Linux udev rule (run once as root so non-root users can access the scope):
 #   echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0699", MODE="0666"' \
@@ -691,7 +1069,14 @@ if __name__ == "__main__":
 #   Utility > I/O > USB Network & PC  →  set to "USB Device"
 #
 # Running
-#   python capture_waveforms.py
+#   python capture_waveforms.py                            # interactive
+#   python capture_waveforms.py --config run.yaml          # headless
+#   python capture_waveforms.py --example-config run.yaml  # write template
+#
+# Programmatic use
+#   from capture_waveforms import run_capture, run_capture_from_yaml
+#   run_capture_from_yaml("run.yaml")
+#   run_capture({"channels": ["CH1"], "capture": {"n_captures": 10}})
 #
 # Reading the HDF5 output in Python
 # ----------------------------------

@@ -1,0 +1,43 @@
+# Tektronix DPO4054 Waveform Capture — Example Configuration
+# -----------------------------------------------------------
+#   python capture_waveforms.py --config config_example.yaml
+#
+# All fields mirror the controls in capture_gui.py.  Any field may be
+# omitted; omitted fields fall back to the defaults baked into
+# DEFAULT_CONFIG in capture_waveforms.py.
+
+output:
+  # Final filename is {data_dir}/{prefix}_{YYYYMMDD_HHMMSS}.h5
+  # unless `filename` is set explicitly (which overrides prefix+timestamp).
+  prefix:    waveforms
+  filename:  null
+  data_dir:  ./data
+  save_root: false           # also write a .root file via uproot
+  save_screenshot_begin: true  # save scope PNG before first capture ({prefix}_{ts}_begin.png)
+  save_screenshot_end:   true  # save scope PNG after last capture  ({prefix}_{ts}_end.png)
+
+# Channels to capture — any subset of CH1, CH2, CH3, CH4.
+channels:
+  - CH1
+
+# Time window around the trigger, in nanoseconds.
+# Set both to 0 to capture the full record length.
+trigger_window:
+  pre_ns:  1000.0
+  post_ns: 1000.0
+
+capture:
+  n_captures: 1              # number of triggered acquisitions
+  wait_s:     0.0            # pause between successive captures (seconds)
+  label:      ""             # HDF5 group label; "" → capture_HHMMSS
+  notes:      ""             # free-text notes saved with each capture
+
+acquisition:
+  # SAMPLE | AVERAGE | HIRES | ENVELOPE | PEAKDETECT
+  mode:   SAMPLE
+  numavg: 16                 # only used when mode == AVERAGE
+
+measurements:
+  # Query scope-side measurements (AMPLITUDE, MEAN, RMS, FREQUENCY, …) and
+  # store them as channel HDF5 attributes. Adds ~1–2 s per capture.
+  enabled: false

@@ -8,8 +8,10 @@ Captures waveforms from a **Tektronix DPO4054 Digital Phosphor Oscilloscope** (5
 - Tektronix DPO4054 connected via USB-B cable
 
 ```bash
-pip install pyvisa pyvisa-py numpy h5py pyusb
+pip install pyvisa pyvisa-py numpy h5py pyusb pyyaml
 ```
+
+(`pyyaml` is only needed if you drive captures from a YAML config; see [config_example.yaml](config_example.yaml).)
 
 **Linux only** — grant non-root USB access (run once):
 
@@ -48,11 +50,46 @@ Opens an interactive window with:
 
 ### CLI
 
+`capture_waveforms.py` runs in three modes:
+
 ```bash
+# 1. Interactive — prompts for each parameter
 python capture_waveforms.py
+
+# 2. Headless — all parameters from a YAML file
+python capture_waveforms.py --config config_example.yaml
+
+# 3. Generate a template YAML file
+python capture_waveforms.py --example-config my_run.yaml
 ```
 
-The script will:
+The headless mode exposes the same parameters as the GUI (channels, ns-based trigger window, number of captures, wait-between, acquisition mode + averages, scope measurements, ROOT output, label, notes) plus automatic begin/end screenshots. See [config_example.yaml](config_example.yaml) for a fully-commented template.
+
+#### Programmatic use
+
+`run_capture()` and `run_capture_from_yaml()` are importable:
+
+```python
+from capture_waveforms import run_capture, run_capture_from_yaml
+
+# From a YAML file
+out_path = run_capture_from_yaml("my_run.yaml")
+
+# From a Python dict (any subset of fields; missing keys use DEFAULT_CONFIG)
+out_path = run_capture({
+    "channels": ["CH1", "CH2"],
+    "trigger_window": {"pre_ns": 500, "post_ns": 2000},
+    "capture":        {"n_captures": 100, "wait_s": 0.1, "label": "run42"},
+    "acquisition":    {"mode": "AVERAGE", "numavg": 16},
+    "measurements":   {"enabled": True},
+})
+```
+
+Pass an already-open `pyvisa` resource as the optional `scope=` argument to reuse a connection across calls; otherwise the function connects and disconnects itself.
+
+#### Interactive mode
+
+In interactive mode the script will:
 
 1. Scan for USB instruments and connect to the scope
 2. Prompt for an output `.h5` file (default: timestamped filename)
@@ -62,6 +99,8 @@ The script will:
    - Enter number of captures and a capture label
    - Enter optional notes
    - Capture and save, then prompt to capture again
+
+Interactive mode uses **samples** for the trigger window; YAML/GUI modes use **nanoseconds**.
 
 ## Output files
 
@@ -127,7 +166,16 @@ Columns:
 
 ### Screenshots
 
-The **Screenshot** button saves the scope display as a PNG via the `HARDCOPY` SCPI command over USBTMC. Files are named `{prefix}_{timestamp}_shot{N}.png` in the same `./data/` directory as the waveform file. The counter resets when the output filename is refreshed.
+Screenshots are saved as PNG via the `HARDCOPY` SCPI command over USBTMC.
+
+**GUI** — the **Screenshot** button saves on demand to `{prefix}_{timestamp}_shot{N}.png`; the counter resets when New Filename is clicked.
+
+**Headless / YAML** — `output.save_screenshot_begin` (default `true`) and `output.save_screenshot_end` (default `true`) save the scope display automatically before the first capture and after the last one. Files are placed alongside the HDF5 output with the same stem:
+
+```
+waveforms_20260520_143022_begin.png
+waveforms_20260520_143022_end.png
+```
 
 ## Notes
 
