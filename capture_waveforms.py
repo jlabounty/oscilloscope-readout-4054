@@ -322,12 +322,26 @@ def save_hdf5(
                     "instrument_setup",
                     data=np.frombuffer(blob_bytes, dtype="uint8"),
                     compression="gzip",
+                    compression_opts=6,
+                    shuffle=True,
                 )
 
         for ch_name, (time_s, volts, meta) in channels.items():
             ch_grp = cap_grp.create_group(ch_name)
-            ds_t = ch_grp.create_dataset("time_s", data=time_s, compression="gzip")
-            ds_v = ch_grp.create_dataset("volts",  data=volts,  compression="gzip")
+            ds_t = ch_grp.create_dataset(
+                "time_s",
+                data=time_s,
+                compression="gzip",
+                compression_opts=6,
+                shuffle=True,
+            )
+            ds_v = ch_grp.create_dataset(
+                "volts",
+                data=volts.astype("float32"),
+                compression="gzip",
+                compression_opts=6,
+                shuffle=True,
+            )
             ds_t.attrs["units"] = "s"
             ds_v.attrs["units"] = meta.get("YUNIT", "V")
             # Store WFMPRE preamble + per-channel display settings (CH_* keys)
